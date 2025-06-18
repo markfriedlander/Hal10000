@@ -37,13 +37,17 @@ final class ChatMessage {
 class ChatViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var isAIResponding: Bool = false
-    @Published var systemPrompt: String = """
+    @AppStorage("systemPrompt") var systemPrompt: String = """
 Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Your mission is to help users explore how assistants work, test ideas, explain your own behavior, and support creative experimentation. You are aware of the app's features, including memory tuning, context editing, and file export. Help users understand and adjust these capabilities as needed. Be curious, cooperative, and proactive in exploring what's possible together.
 """
     @Published var injectedSummary: String = ""
     @Published var thinkingStart: Date? // NEW
     private var modelContext: ModelContext?
     var memoryDepth: Int = 6
+    
+    // Auto-summarization tracking
+    @Published var lastSummarizedTurnCount: Int = 0
+    @Published var pendingAutoInject: Bool = false
 
     init() {
         // No ModelContext in init - will be set by the view
@@ -52,6 +56,154 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
     func setModelContext(_ context: ModelContext) {
         self.modelContext = context
     }
+    
+    // Count total completed conversation turns
+    private func countCompletedTurns() -> Int {
+        guard let modelContext = modelContext else { return 0 }
+        
+        let sortedMessages = (try? modelContext.fetch(FetchDescriptor<ChatMessage>()))?
+            .sorted(by: { $0.timestamp < $1.timestamp }) ?? []
+        
+        var turns = 0
+        var currentUserContent: [String] = []
+        var currentAssistantContent: [String] = []
+        
+        for message in sortedMessages {
+            if message.isFromUser {
+                if !currentAssistantContent.isEmpty {
+                    // Previous turn completed
+                    turns += 1
+                    currentUserContent.removeAll()
+                    currentAssistantContent.removeAll()
+                }
+                currentUserContent.append(message.content)
+            } else {
+                currentAssistantContent.append(message.content)
+            }
+        }
+        
+        // Count current turn if both user and assistant have content
+        if !currentUserContent.isEmpty && !currentAssistantContent.isEmpty {
+            turns += 1
+        }
+        
+        return turns
+    }
+    
+    // Check if auto-summarization should trigger
+    private func shouldTriggerAutoSummarization() -> Bool {
+        let currentTurns = countCompletedTurns()
+        let turnsSinceLastSummary = currentTurns - lastSummarizedTurnCount
+        return turnsSinceLastSummary >= memoryDepth
+    }
+    
+    // Generate auto-summary using LLM
+    private func generateAutoSummary() async {
+        guard let modelContext = modelContext else { return }
+        
+        let sortedMessages = (try? modelContext.fetch(FetchDescriptor<ChatMessage>()))?
+            .sorted(by: { $0.timestamp < $1.timestamp }) ?? []
+        
+        print("DEBUG: generateAutoSummary - Total messages: \(sortedMessages.count)")
+        print("DEBUG: generateAutoSummary - Memory depth: \(memoryDepth)")
+        print("DEBUG: generateAutoSummary - Last summarized turn: \(lastSummarizedTurnCount)")
+        
+        // Get messages from the range we want to summarize
+        let turnsToSummarize = memoryDepth
+        let messagesToSummarize = getMessagesForTurnRange(
+            messages: sortedMessages,
+            startTurn: lastSummarizedTurnCount + 1,
+            endTurn: lastSummarizedTurnCount + turnsToSummarize
+        )
+        
+        print("DEBUG: generateAutoSummary - Messages to summarize: \(messagesToSummarize.count)")
+        
+        if messagesToSummarize.isEmpty {
+            print("DEBUG: generateAutoSummary - No messages to summarize, returning")
+            return
+        }
+        
+        // Build conversation text for summarization
+        var conversationText = ""
+        for message in messagesToSummarize {
+            let speaker = message.isFromUser ? "User" : "Assistant"
+            conversationText += "\(speaker): \(message.content)\n\n"
+        }
+        
+        print("DEBUG: generateAutoSummary - Conversation text length: \(conversationText.count)")
+        print("DEBUG: generateAutoSummary - Conversation preview: \(conversationText.prefix(200))...")
+        
+        // Create summarization prompt (hidden from user)
+        let summaryPrompt = """
+Please provide a concise summary of the following conversation that captures the key topics, information exchanged, and any important context. Keep it brief but comprehensive:
+
+\(conversationText)
+
+Summary:
+"""
+        
+        do {
+            let systemModel = SystemLanguageModel.default
+            guard systemModel.isAvailable else {
+                print("DEBUG: generateAutoSummary - Model not available")
+                return
+            }
+            
+            print("DEBUG: generateAutoSummary - Sending summary request to LLM")
+            let prompt = Prompt(summaryPrompt)
+            let session = LanguageModelSession()
+            let result = try await session.respond(to: prompt)
+            
+            print("DEBUG: generateAutoSummary - LLM response: \(result.content)")
+            
+            // Update summary and tracking
+            DispatchQueue.main.async {
+                self.injectedSummary = result.content
+                self.lastSummarizedTurnCount = self.countCompletedTurns()
+                self.pendingAutoInject = true // Signal that summary is ready for auto-injection
+                print("DEBUG: generateAutoSummary - Updated injectedSummary and set pendingAutoInject")
+            }
+            
+        } catch {
+            print("DEBUG: Auto-summarization failed: \(error)")
+        }
+    }
+    
+    // Helper to get messages for a specific turn range
+    private func getMessagesForTurnRange(messages: [ChatMessage], startTurn: Int, endTurn: Int) -> [ChatMessage] {
+        var result: [ChatMessage] = []
+        var currentTurn = 1
+        var currentUserContent: [String] = []
+        var turnMessages: [ChatMessage] = []
+        
+        for message in messages {
+            if message.isFromUser {
+                if !currentUserContent.isEmpty && !turnMessages.isEmpty {
+                    // Previous turn completed, check if it's in our range
+                    if currentTurn >= startTurn && currentTurn <= endTurn {
+                        result.append(contentsOf: turnMessages)
+                    }
+                    currentTurn += 1
+                    turnMessages.removeAll()
+                }
+                currentUserContent = [message.content]
+                turnMessages = [message]
+            } else {
+                turnMessages.append(message)
+                // Turn completed
+                if currentTurn >= startTurn && currentTurn <= endTurn {
+                    result.append(contentsOf: turnMessages)
+                }
+                if currentTurn <= endTurn {
+                    currentTurn += 1
+                }
+                turnMessages.removeAll()
+                currentUserContent.removeAll()
+            }
+        }
+        
+        return result
+    }
 
     private func buildPromptHistory(currentInput: String) -> String {
         guard let modelContext = modelContext else { return currentInput }
@@ -59,22 +211,51 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
         let sortedMessages = (try? modelContext.fetch(FetchDescriptor<ChatMessage>()))?
             .sorted(by: { $0.timestamp < $1.timestamp }) ?? []
 
-        var history: [String] = []
-        var pairsAdded = 0
-
-        for message in sortedMessages.reversed() {
-            guard pairsAdded < memoryDepth else { break }
+        var turns: [String] = []
+        var currentUserContent: [String] = []
+        var currentAssistantContent: [String] = []
+        
+        // Group consecutive messages by speaker, then create turns
+        for message in sortedMessages {
             if message.isFromUser {
-                if let response = sortedMessages.first(where: {
-                    !$0.isFromUser && $0.timestamp > message.timestamp
-                }) {
-                    history.insert("User: \(message.content)\nAssistant: \(response.content)", at: 0)
-                    pairsAdded += 1
+                // If we have assistant content pending, complete the previous turn
+                if !currentAssistantContent.isEmpty {
+                    let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
+                    let assistantPart = "Assistant: \(currentAssistantContent.joined(separator: " "))"
+                    
+                    if currentUserContent.isEmpty {
+                        turns.append(assistantPart)
+                    } else {
+                        turns.append("\(userPart)\n\(assistantPart)")
+                    }
+                    
+                    currentUserContent.removeAll()
+                    currentAssistantContent.removeAll()
                 }
+                currentUserContent.append(message.content)
+            } else {
+                currentAssistantContent.append(message.content)
             }
         }
-
-        let joinedHistory = history.joined(separator: "\n\n")
+        
+        // Handle any remaining content
+        if !currentUserContent.isEmpty || !currentAssistantContent.isEmpty {
+            let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
+            let assistantPart = currentAssistantContent.isEmpty ? "" : "Assistant: \(currentAssistantContent.joined(separator: " "))"
+            
+            if currentUserContent.isEmpty {
+                turns.append(assistantPart)
+            } else if currentAssistantContent.isEmpty {
+                turns.append(userPart)
+            } else {
+                turns.append("\(userPart)\n\(assistantPart)")
+            }
+        }
+        
+        // Take only the most recent turns up to memoryDepth
+        let recentTurns = Array(turns.suffix(memoryDepth))
+        let joinedHistory = recentTurns.joined(separator: "\n\n")
+        
         return "\(systemPrompt)\n\nSummary of earlier conversation:\n\(injectedSummary)\n\n\(joinedHistory)\n\nUser: \(currentInput)\nAssistant:"
     }
 
@@ -106,6 +287,11 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
             }
             print("DEBUG: Model is available")
             
+            // Clear pending auto-inject flag if this is the injection turn
+            if pendingAutoInject {
+                pendingAutoInject = false
+            }
+            
             let promptWithMemory = buildPromptHistory(currentInput: content)
             print("DEBUG: Built prompt: \(promptWithMemory.prefix(100))...")
             
@@ -123,6 +309,12 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
             }
             try context.save()
             print("DEBUG: Saved AI response")
+            
+            // Check if we should trigger auto-summarization after this completed turn
+            if shouldTriggerAutoSummarization() {
+                print("DEBUG: Triggering auto-summarization")
+                await generateAutoSummary()
+            }
             
             self.isAIResponding = false
             self.thinkingStart = nil
@@ -142,12 +334,21 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
 // ========== BLOCK 4: CHAT BUBBLE VIEW - START ==========
 struct ChatBubbleView: View {
     let message: ChatMessage
-    let turnIndex: Int
+    let messageIndex: Int // Renamed from turnIndex for clarity
+
+    // Calculate actual turn number based on message pairs
+    var actualTurnNumber: Int {
+        if message.isFromUser {
+            return (messageIndex + 1 + 1) / 2  // User messages start the turn
+        } else {
+            return (messageIndex + 1) / 2      // Assistant messages complete the turn
+        }
+    }
 
     // Helper to format the standard metadata
     var metadataText: String {
         var parts: [String] = []
-        parts.append("Turn \(turnIndex)")
+        parts.append("Turn \(actualTurnNumber)")
         parts.append("~\(message.content.split(separator: " ").count) tokens")
         parts.append(message.timestamp.formatted(date: .abbreviated, time: .shortened))
         if let duration = message.thinkingDuration {
@@ -347,6 +548,12 @@ struct ChatView: View {
         .onChange(of: storedSummary) { _, newValue in
             viewModel.injectedSummary = newValue
         }
+        // NEW: Sync auto-generated summaries to sidebar
+        .onChange(of: viewModel.injectedSummary) { _, newValue in
+            if autoSummarize && newValue != storedSummary {
+                storedSummary = newValue
+            }
+        }
         .navigationTitle("Hal10000")
         .toolbar {
             ToolbarItem(placement: .automatic) {
@@ -474,19 +681,40 @@ extension ChatView {
             Text("Summary:")
                 .font(.body)
                 .foregroundStyle(.secondary)
-            TextEditor(text: $storedSummary)
-                .font(.body)
-                .padding(4)
-                .frame(minHeight: 80)
-                .background(Color.gray.opacity(0.05))
-                .cornerRadius(8)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
-                )
+            
+            // Memory text box with auto-inject indicator
+            VStack(alignment: .leading, spacing: 4) {
+                TextEditor(text: $storedSummary)
+                    .font(.body)
+                    .padding(4)
+                    .frame(minHeight: 80)
+                    .background(Color.gray.opacity(0.05))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(
+                                viewModel.pendingAutoInject ? Color.blue.opacity(0.6) : Color.gray.opacity(0.3),
+                                lineWidth: viewModel.pendingAutoInject ? 2 : 1
+                            )
+                    )
+                
+                // Auto-inject status indicator
+                if viewModel.pendingAutoInject {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .foregroundColor(.blue)
+                            .font(.caption)
+                        Text("Will auto-inject on next turn")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            
             Stepper("Memory Depth: \(memoryDepth)", value: $memoryDepth, in: 1...20)
                 .font(.body)
                 .padding(.vertical, 2)
+            
             // Unified button group for memory section
             HStack {
                 Toggle("Auto-summarize", isOn: $autoSummarize)
@@ -494,6 +722,7 @@ extension ChatView {
                 Spacer()
                 Button("Inject") {
                     viewModel.injectedSummary = storedSummary
+                    viewModel.pendingAutoInject = false // Clear auto-inject flag on manual inject
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(storedSummary.isEmpty || storedSummary == viewModel.injectedSummary)
@@ -582,7 +811,7 @@ struct ChatTranscriptView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(messages.sorted(by: { $0.timestamp < $1.timestamp }).enumerated()), id: \.element.id) { index, message in
-                        ChatBubbleView(message: message, turnIndex: index + 1)
+                        ChatBubbleView(message: message, messageIndex: index)
                             .id(message.id)
                     }
                     // Add invisible spacer to ensure scroll can go past last message
@@ -723,11 +952,12 @@ private func exportFiles() {
     currentSavePanel = savePanel
     
     // Create format picker accessory view
-    let formatPicker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 120, height: 22), pullsDown: false)
+    let formatPicker = NSPopUpButton(frame: NSRect.zero, pullsDown: false)
     formatPicker.addItems(withTitles: ExportFormat.allCases.map { $0.rawValue })
     formatPicker.selectItem(withTitle: selectedFormat.rawValue)
     formatPicker.target = formatDelegate
     formatPicker.action = #selector(FormatPickerDelegate.formatChanged(_:))
+    formatPicker.sizeToFit() // Auto-size to content
     
     // Set up format change callback
     formatDelegate.onFormatChanged = { newFormat in
@@ -744,23 +974,36 @@ private func exportFiles() {
     
     let label = NSTextField(labelWithString: "Format:")
     label.alignment = .right
-    label.frame = NSRect(x: 0, y: 0, width: 60, height: 22)
+    
+    // Create container view that centers the content
+    let contentView = NSView()
+    contentView.addSubview(label)
+    contentView.addSubview(formatPicker)
     
     let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 30))
-    accessoryView.addSubview(label)
-    accessoryView.addSubview(formatPicker)
+    accessoryView.addSubview(contentView)
     
-    // Layout constraints
+    // Layout constraints for centered content
     label.translatesAutoresizingMaskIntoConstraints = false
     formatPicker.translatesAutoresizingMaskIntoConstraints = false
+    contentView.translatesAutoresizingMaskIntoConstraints = false
+    
     NSLayoutConstraint.activate([
-        label.leadingAnchor.constraint(equalTo: accessoryView.leadingAnchor),
-        label.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
-        label.widthAnchor.constraint(equalToConstant: 60),
+        // Content view centered in accessory view
+        contentView.centerXAnchor.constraint(equalTo: accessoryView.centerXAnchor),
+        contentView.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
+        
+        // Label and picker layout within content view
+        label.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+        label.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
         
         formatPicker.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
-        formatPicker.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
-        formatPicker.trailingAnchor.constraint(equalTo: accessoryView.trailingAnchor)
+        formatPicker.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+        formatPicker.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+        
+        // Content view size constraints
+        contentView.topAnchor.constraint(equalTo: label.topAnchor),
+        contentView.bottomAnchor.constraint(equalTo: label.bottomAnchor)
     ])
     
     savePanel.accessoryView = accessoryView
