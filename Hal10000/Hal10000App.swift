@@ -5,7 +5,11 @@ import Foundation
 import Combine
 import Observation
 import FoundationModels
+import UniformTypeIdentifiers
 // ========== BLOCK 1: IMPORTS AND APP ENTRY POINT - END ==========
+
+// Global variable to share ModelContainer for transcript export
+var sharedConversationContext: ModelContainer?
 
 // ========== BLOCK 2: CHAT MESSAGE MODEL - START ==========
 @Model
@@ -15,6 +19,7 @@ final class ChatMessage {
     var isFromUser: Bool
     var timestamp: Date
     var isPartial: Bool
+    var thinkingDuration: TimeInterval? // NEW
 
     init(content: String, isFromUser: Bool, isPartial: Bool = false) {
         self.id = UUID()
@@ -22,6 +27,7 @@ final class ChatMessage {
         self.isFromUser = isFromUser
         self.timestamp = Date()
         self.isPartial = isPartial
+        self.thinkingDuration = nil
     }
 }
 // ========== BLOCK 2: CHAT MESSAGE MODEL - END ==========
@@ -31,8 +37,11 @@ final class ChatMessage {
 class ChatViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var isAIResponding: Bool = false
-    @Published var systemPrompt: String = "You are a helpful assistant."
+    @Published var systemPrompt: String = """
+Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Your mission is to help users explore how assistants work, test ideas, explain your own behavior, and support creative experimentation. You are aware of the app's features, including memory tuning, context editing, and file export. Help users understand and adjust these capabilities as needed. Be curious, cooperative, and proactive in exploring what's possible together.
+"""
     @Published var injectedSummary: String = ""
+    @Published var thinkingStart: Date? // NEW
     private var modelContext: ModelContext?
     var memoryDepth: Int = 6
 
@@ -74,6 +83,7 @@ class ChatViewModel: ObservableObject {
         
         print("DEBUG: Starting sendMessage with content: \(content)")
         self.isAIResponding = true
+        self.thinkingStart = Date()
         
         // Use the passed context (same one that @Query uses)
         let userMessage = ChatMessage(content: content, isFromUser: true)
@@ -101,24 +111,28 @@ class ChatViewModel: ObservableObject {
             
             let prompt = Prompt(promptWithMemory)
             let session = LanguageModelSession()
-            print("DEBUG: Created session, about to call respond")
-            
-            // For basic text, use respond(to:) not streamResponse
-            let response = try await session.respond(to: prompt)
-            print("DEBUG: Got response: \(response.content.prefix(100))...")
-            
-            aiMessage.content = response.content
+            print("DEBUG: Created session, about to call response")
+
+            // Non-streaming response
+            let result = try await session.respond(to: prompt)
+            let response = result.content
+            aiMessage.content = response
             aiMessage.isPartial = false
+            if let start = thinkingStart {
+                aiMessage.thinkingDuration = Date().timeIntervalSince(start)
+            }
             try context.save()
             print("DEBUG: Saved AI response")
             
             self.isAIResponding = false
+            self.thinkingStart = nil
         } catch {
             print("DEBUG: Error occurred: \(error)")
             aiMessage.isPartial = false
             aiMessage.content = "Error: \(error.localizedDescription)"
             self.errorMessage = error.localizedDescription
             self.isAIResponding = false
+            self.thinkingStart = nil
             try? context.save()
         }
     }
@@ -128,22 +142,79 @@ class ChatViewModel: ObservableObject {
 // ========== BLOCK 4: CHAT BUBBLE VIEW - START ==========
 struct ChatBubbleView: View {
     let message: ChatMessage
+    let turnIndex: Int
+
+    // Helper to format the standard metadata
+    var metadataText: String {
+        var parts: [String] = []
+        parts.append("Turn \(turnIndex)")
+        parts.append("~\(message.content.split(separator: " ").count) tokens")
+        parts.append(message.timestamp.formatted(date: .abbreviated, time: .shortened))
+        if let duration = message.thinkingDuration {
+            parts.append(String(format: "%.1f sec", duration))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    // Footer view with spinner/timer only when partial
+    @ViewBuilder
+    var footerView: some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            if message.isPartial {
+                HStack(spacing: 4) {
+                    Text("Thinking")
+                    ProgressView().scaleEffect(0.7)
+                    TimerView(startDate: message.timestamp)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .transition(.opacity)
+            }
+            Text(metadataText)
+                .textSelection(.enabled)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .transition(.opacity)
+        }
+        .padding(.top, 2)
+    }
 
     var body: some View {
         HStack {
             if message.isFromUser {
                 Spacer()
-                Text(message.content)
-                    .padding()
-                    .background(Color.accentColor.opacity(0.7))
-                    .foregroundColor(.white)
-                    .cornerRadius(12)
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text(message.content)
+                        .font(.title3)
+                        .textSelection(.enabled)
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 14)
+                        .background(
+                            GeometryReader { geometry in
+                                Color.accentColor.opacity(0.7)
+                            }
+                        )
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+                        .transition(.move(edge: .bottom))
+                    footerView
+                }
             } else {
-                Text(message.content)
-                    .padding()
-                    .background(Color.gray.opacity(0.3))
-                    .foregroundColor(.primary)
-                    .cornerRadius(12)
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text(message.content)
+                        .font(.title3)
+                        .textSelection(.enabled)
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 14)
+                        .background(
+                            GeometryReader { geometry in
+                                Color.gray.opacity(0.3)
+                            }
+                        )
+                        .foregroundColor(.primary)
+                        .cornerRadius(12)
+                    footerView
+                }
                 Spacer()
             }
         }
@@ -151,7 +222,22 @@ struct ChatBubbleView: View {
         .padding(.vertical, 4)
         .opacity(message.isPartial ? 0.85 : 1.0)
         .scaleEffect(message.isPartial ? 0.98 : 1.0)
-        .animation(.smooth(duration: 0.3), value: message.isPartial)
+        .animation(.interactiveSpring(response: 0.6, dampingFraction: 0.7, blendDuration: 0.3), value: message.isPartial)
+        .animation(.interactiveSpring(response: 0.6, dampingFraction: 0.7, blendDuration: 0.3), value: message.id)
+        .transaction { $0.animation = .default }
+    }
+}
+
+// TimerView: Shows elapsed time since startDate, updating every 0.5s
+struct TimerView: View {
+    let startDate: Date
+    var body: some View {
+        TimelineView(.periodic(from: startDate, by: 0.5)) { context in
+            let elapsed = context.date.timeIntervalSince(startDate)
+            Text(String(format: "%.1f sec", max(0, elapsed)))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
     }
 }
 // ========== BLOCK 4: CHAT BUBBLE VIEW - END ==========
@@ -162,9 +248,13 @@ struct ChatView: View {
     @Query private var messages: [ChatMessage]
     @State private var userInput: String = ""
     @StateObject private var viewModel = ChatViewModel()
-    @State private var isShowingPromptEditor: Bool = true
     @State private var isShowingDebugger: Bool = false
+    @AppStorage("isShowingBehavior") private var isShowingBehavior: Bool = false
+    @AppStorage("isShowingMemory") private var isShowingMemory: Bool = false
     @State private var showTokenCounts: Bool = false
+    @State private var scrollTrigger = UUID()
+    @State private var lastMessageID: UUID? = nil
+    @State private var showResetConfirmation = false
 
     @AppStorage("memoryDepth") private var memoryDepth: Int = 6
     @AppStorage("autoSummarize") private var autoSummarize: Bool = true
@@ -180,136 +270,64 @@ struct ChatView: View {
         return fullText.split(separator: " ").count
     }
 
+    private var memoryMeterColor: Color {
+        switch estimatedTokenCount {
+        case 0..<3000: return .green
+        case 3000..<7000: return .yellow
+        default: return .red
+        }
+    }
+
     var body: some View {
         NavigationSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    Toggle("Show System Prompt", isOn: $isShowingPromptEditor)
-                        .font(.caption)
-
-                    if isShowingPromptEditor {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("System Prompt:")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            TextEditor(text: $viewModel.systemPrompt)
-                                .frame(minHeight: 60)
-                                .border(Color.gray.opacity(0.3), width: 1)
-
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Stepper("Memory Depth: \(memoryDepth)", value: $memoryDepth, in: 1...20)
-                                        .font(.caption2)
-
-                                    Toggle("Auto-summarize", isOn: $autoSummarize)
-                                        .font(.caption2)
-                                }
-                            }
-
-                            Text("Summary injected:")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-
-                            TextEditor(text: $storedSummary)
-                                .frame(minHeight: 40)
-                                .border(Color.gray.opacity(0.3), width: 1)
-                        }
-                    }
-
-                    DisclosureGroup("Context Debugger", isExpanded: $isShowingDebugger) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Toggle("Show token count per message", isOn: $showTokenCounts)
-                                .font(.caption2)
-
-                            Text("Estimated tokens: \(estimatedTokenCount)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-
-                            Text("Full prompt sent to model:")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            ScrollView {
-                                Text(buildFullPromptPreview())
-                                    .font(.caption2)
-                                    .padding(4)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(height: 120)
-                            .background(Color.gray.opacity(0.05))
-                            .cornerRadius(8)
-                            .border(Color.gray.opacity(0.2), width: 1)
-                        }
-                    }
-                    
-                    Button("Start Over", role: .destructive) {
-                        do {
-                            for message in messages {
-                                modelContext.delete(message)
-                            }
-                            try modelContext.save()
-                            viewModel.systemPrompt = "You are a helpful assistant."
-                            storedSummary = ""
-                            memoryDepth = 6
-                            autoSummarize = true
-                        } catch {
-                            viewModel.errorMessage = "Failed to reset conversation."
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .padding(.top, 16)
+                    behaviorSection
+                    memorySection
+                    contextSection
                 }
                 .padding()
             }
         } detail: {
             VStack {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading) {
-                            ForEach(messages.sorted(by: { $0.timestamp < $1.timestamp })) { message in
-                                ChatBubbleView(message: message)
-                                    .id(message.id)
-                            }
-                            
-                            if viewModel.isAIResponding {
-                                HStack {
-                                    ProgressView()
-                                        .scaleEffect(0.8)
-                                    Text("Hal is thinking...")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                }
-                                .padding(.horizontal)
-                            }
-                        }
-                        .onChange(of: messages.count) { _, _ in
-                            if let last = messages.last {
-                                proxy.scrollTo(last.id, anchor: .bottom)
-                            }
-                        }
-                    }
-                }
+                ChatTranscriptView(messages: messages)
 
                 HStack {
-                    TextField("Type a message...", text: $userInput, axis: .vertical)
-                        .textFieldStyle(.roundedBorder)
-                        .lineLimit(3...6)
+                    TextEditor(text: $userInput)
+                        .font(.title3)
+                        .frame(minHeight: 40, maxHeight: 120)
+                        .padding(8)
+                        .background(Color(.textBackgroundColor))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                        )
+                        .onKeyPress { press in
+                            if press.key == KeyEquivalent.return && !press.modifiers.contains(EventModifiers.shift) {
+                                let text = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !text.isEmpty else { return .ignored }
+                                userInput = ""
+                                Task {
+                                    await viewModel.sendMessage(text, using: modelContext)
+                                    lastMessageID = messages.last?.id
+                                }
+                                return .handled
+                            }
+                            return .ignored
+                        }
 
                     Button("Send") {
-                        print("DEBUG: Send button tapped")
-                        let text = userInput
+                        let text = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !text.isEmpty else { return }
                         userInput = ""
-                        print("DEBUG: About to call sendMessage with text: '\(text)'")
                         Task {
-                            print("DEBUG: Inside Task, calling sendMessage")
                             await viewModel.sendMessage(text, using: modelContext)
-                            print("DEBUG: sendMessage completed")
+                            lastMessageID = messages.last?.id
                         }
                     }
-                    .disabled(userInput.isEmpty || viewModel.isAIResponding)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(userInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isAIResponding)
                 }
                 .padding()
             }
@@ -318,6 +336,10 @@ struct ChatView: View {
             viewModel.setModelContext(modelContext)
             viewModel.memoryDepth = memoryDepth
             viewModel.injectedSummary = storedSummary
+            // Ensure scroll on initial load
+            DispatchQueue.main.async {
+                lastMessageID = messages.last?.id
+            }
         }
         .onChange(of: memoryDepth) { _, newValue in
             viewModel.memoryDepth = newValue
@@ -326,6 +348,14 @@ struct ChatView: View {
             viewModel.injectedSummary = newValue
         }
         .navigationTitle("Hal10000")
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Text("Memory Meter: ~\(estimatedTokenCount)")
+                    .font(.callout)
+                    .foregroundStyle(memoryMeterColor)
+                    .help("Estimated total tokens currently in memory (system prompt + chat)")
+            }
+        }
         .alert("Error", isPresented: Binding(get: {
             viewModel.errorMessage != nil
         }, set: { _ in
@@ -334,6 +364,30 @@ struct ChatView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(viewModel.errorMessage ?? "Unknown error")
+        }
+        .alert("Start Over?", isPresented: $showResetConfirmation) {
+            Button("Cancel", role: .cancel) {
+                showResetConfirmation = false
+            }
+            Button("Start Over", role: .destructive) {
+                do {
+                    for message in messages {
+                        modelContext.delete(message)
+                    }
+                    try modelContext.save()
+                    viewModel.systemPrompt = """
+Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Your mission is to help users explore how assistants work, test ideas, explain your own behavior, and support creative experimentation. You are aware of the app's features, including memory tuning, context editing, and file export. Help users understand and adjust these capabilities as needed. Be curious, cooperative, and proactive in exploring what's possible together.
+"""
+                    storedSummary = ""
+                    memoryDepth = 6
+                    autoSummarize = true
+                } catch {
+                    viewModel.errorMessage = "Failed to reset conversation."
+                }
+                showResetConfirmation = false
+            }
+        } message: {
+            Text("This will permanently erase all messages in this conversation. Are you sure?")
         }
     }
 
@@ -352,9 +406,206 @@ struct ChatView: View {
         return viewModel.systemPrompt + "\n\n" + messageText + "\n\nUser: \(userInput)\nAssistant:"
     }
 }
+
+// MARK: - Section Extraction for ChatView
+extension ChatView {
+    @ViewBuilder
+    var behaviorSection: some View {
+        DisclosureGroup(isExpanded: $isShowingBehavior) {
+            behaviorSectionBody
+        } label: {
+            behaviorSectionLabel
+        }
+        .font(.body)
+        .padding(.vertical, 2)
+        .background(Color.gray.opacity(0.04))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    var behaviorSectionBody: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("System Prompt:")
+                .font(.body)
+                .foregroundStyle(.secondary)
+            TextEditor(text: $viewModel.systemPrompt)
+                .font(.body)
+                .padding(4)
+                .frame(minHeight: 60)
+                .background(Color.gray.opacity(0.05))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                )
+        }
+        .padding(4)
+    }
+
+    var behaviorSectionLabel: some View {
+        Text("Behavior")
+            .font(.title3)
+    }
+
+    @ViewBuilder
+    var memorySection: some View {
+        DisclosureGroup(isExpanded: $isShowingMemory) {
+            memorySectionBody
+        } label: {
+            memorySectionLabel
+        }
+        .font(.body)
+        .padding(.vertical, 2)
+        .background(Color.gray.opacity(0.04))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    var memorySectionBody: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Summary:")
+                .font(.body)
+                .foregroundStyle(.secondary)
+            TextEditor(text: $storedSummary)
+                .font(.body)
+                .padding(4)
+                .frame(minHeight: 80)
+                .background(Color.gray.opacity(0.05))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                )
+            Stepper("Memory Depth: \(memoryDepth)", value: $memoryDepth, in: 1...20)
+                .font(.body)
+                .padding(.vertical, 2)
+            // Unified button group for memory section
+            HStack {
+                Toggle("Auto-summarize", isOn: $autoSummarize)
+                    .font(.body)
+                Spacer()
+                Button("Inject") {
+                    viewModel.injectedSummary = storedSummary
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(storedSummary.isEmpty || storedSummary == viewModel.injectedSummary)
+            }
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+        }
+        .padding(4)
+    }
+
+    var memorySectionLabel: some View {
+        Text("Memory")
+            .font(.title3)
+    }
+
+    @ViewBuilder
+    var contextSection: some View {
+        DisclosureGroup(isExpanded: $isShowingDebugger) {
+            contextSectionBody
+        } label: {
+            contextSectionLabel
+        }
+        .font(.body)
+        .padding(.vertical, 2)
+        .background(Color.gray.opacity(0.04))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    var contextSectionBody: some View {
+        let contextString = buildFullPromptPreview()
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Full prompt sent to model:")
+                .font(.body)
+                .foregroundStyle(.secondary)
+            ScrollView {
+                Text(contextString)
+                    .font(.body)
+                    .padding(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 160)
+            .background(Color.gray.opacity(0.05))
+            .cornerRadius(8)
+            .border(Color.gray.opacity(0.2), width: 1)
+            contextButtons(contextString: contextString)
+        }
+    }
+
+    @ViewBuilder
+    func contextButtons(contextString: String) -> some View {
+        HStack {
+            Button("Copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(contextString, forType: .string)
+            }
+            .buttonStyle(.borderedProminent)
+            Spacer()
+            Button("Start Over") {
+                showResetConfirmation = true
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+    }
+
+    var contextSectionLabel: some View {
+        Text("Context")
+            .font(.title3)
+    }
+}
 // ========== BLOCK 5: MAIN CHAT VIEW - END ==========
 
 // ========== BLOCK 6: APP ENTRY POINT - START ==========
+
+struct ChatTranscriptView: View {
+    let messages: [ChatMessage]
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(messages.sorted(by: { $0.timestamp < $1.timestamp }).enumerated()), id: \.element.id) { index, message in
+                        ChatBubbleView(message: message, turnIndex: index + 1)
+                            .id(message.id)
+                    }
+                    // Add invisible spacer to ensure scroll can go past last message
+                    Color.clear
+                        .frame(height: 20)
+                        .id("bottom-spacer")
+                }
+                .padding(.bottom, 80)
+            }
+            .onChange(of: messages.count) { _, _ in
+                if let lastMessage = messages.sorted(by: { $0.timestamp < $1.timestamp }).last {
+                    proxy.scrollTo("bottom-spacer", anchor: .bottom)
+                }
+            }
+            .onAppear {
+                if !messages.isEmpty {
+                    proxy.scrollTo("bottom-spacer", anchor: .bottom)
+                }
+            }
+        }
+    }
+}
+
 @main
 struct Hal10000App: App {
     var sharedModelContainer: ModelContainer = {
@@ -368,6 +619,277 @@ struct Hal10000App: App {
             ChatView()
         }
         .modelContainer(sharedModelContainer)
+        .commands {
+            CommandGroup(replacing: .saveItem) {
+                Button("Export…") {
+                    exportFiles()
+                }
+                .keyboardShortcut("E", modifiers: [.command, .shift])
+            }
+        }
+    }
+    init() {
+        sharedConversationContext = sharedModelContainer
     }
 }
+
+// MARK: - Export Transcript Functionality
+import AppKit
+
+// Export format options
+enum ExportFormat: String, CaseIterable {
+    case text = "Text"
+    case thread = "Thread"
+    case dna = "DNA"
+    
+    var fileExtension: String {
+        switch self {
+        case .text: return "txt"
+        case .thread: return "thread"
+        case .dna: return "llmdna"
+        }
+    }
+    
+    var utType: UTType {
+        switch self {
+        case .text: return .plainText
+        case .thread: return UTType(exportedAs: "com.markfriedlander.halchat.thread", conformingTo: .json)
+        case .dna: return UTType(exportedAs: "com.markfriedlander.halchat.llmdna", conformingTo: .json)
+        }
+    }
+}
+
+// Format picker delegate class
+private class FormatPickerDelegate: NSObject {
+    var onFormatChanged: ((ExportFormat) -> Void)?
+    
+    @objc func formatChanged(_ sender: NSPopUpButton) {
+        let selectedFormat = ExportFormat.allCases[sender.indexOfSelectedItem]
+        onFormatChanged?(selectedFormat)
+    }
+}
+
+// Global variables for format picker
+private var selectedFormat: ExportFormat = .thread
+private weak var currentSavePanel: NSSavePanel?
+private var formatDelegate = FormatPickerDelegate()
+
+private func exportFiles() {
+    guard let modelContainer = sharedConversationContext else {
+        print("ERROR: No model container available for export")
+        return
+    }
+
+    // Get current data for export
+    let context = ModelContext(modelContainer)
+    let messages: [ChatMessage]
+    let systemPrompt: String
+    let memoryDepth: Int
+    let summary: String
+    
+    do {
+        messages = try context.fetch(FetchDescriptor<ChatMessage>())
+        // Get settings from UserDefaults (matches @AppStorage keys)
+        systemPrompt = UserDefaults.standard.string(forKey: "systemPrompt") ?? "Hello, Hal. You are an experimental AI assistant..."
+        memoryDepth = UserDefaults.standard.integer(forKey: "memoryDepth") != 0 ? UserDefaults.standard.integer(forKey: "memoryDepth") : 6
+        summary = UserDefaults.standard.string(forKey: "injectedSummary") ?? ""
+    } catch {
+        showErrorAlert("Failed to read conversation data: \(error.localizedDescription)")
+        return
+    }
+    
+    // Check for partial messages
+    let partialMessages = messages.filter { $0.isPartial }
+    if !partialMessages.isEmpty {
+        let alert = NSAlert()
+        alert.messageText = "Conversation In Progress"
+        alert.informativeText = "There are \(partialMessages.count) message(s) still being generated. Do you want to wait for completion or export anyway?"
+        alert.addButton(withTitle: "Wait")
+        alert.addButton(withTitle: "Export Anyway")
+        alert.addButton(withTitle: "Cancel")
+        
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn: // Wait
+            return // User should wait for completion
+        case .alertSecondButtonReturn: // Export Anyway
+            break // Continue with export
+        default: // Cancel
+            return
+        }
+    }
+
+    let savePanel = NSSavePanel()
+    currentSavePanel = savePanel
+    
+    // Create format picker accessory view
+    let formatPicker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 120, height: 22), pullsDown: false)
+    formatPicker.addItems(withTitles: ExportFormat.allCases.map { $0.rawValue })
+    formatPicker.selectItem(withTitle: selectedFormat.rawValue)
+    formatPicker.target = formatDelegate
+    formatPicker.action = #selector(FormatPickerDelegate.formatChanged(_:))
+    
+    // Set up format change callback
+    formatDelegate.onFormatChanged = { newFormat in
+        selectedFormat = newFormat
+        
+        // Update filename extension
+        let currentName = savePanel.nameFieldStringValue
+        let nameWithoutExtension = (currentName as NSString).deletingPathExtension
+        savePanel.nameFieldStringValue = "\(nameWithoutExtension).\(newFormat.fileExtension)"
+        
+        // Update allowed content types
+        savePanel.allowedContentTypes = [newFormat.utType]
+    }
+    
+    let label = NSTextField(labelWithString: "Format:")
+    label.alignment = .right
+    label.frame = NSRect(x: 0, y: 0, width: 60, height: 22)
+    
+    let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 30))
+    accessoryView.addSubview(label)
+    accessoryView.addSubview(formatPicker)
+    
+    // Layout constraints
+    label.translatesAutoresizingMaskIntoConstraints = false
+    formatPicker.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+        label.leadingAnchor.constraint(equalTo: accessoryView.leadingAnchor),
+        label.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
+        label.widthAnchor.constraint(equalToConstant: 60),
+        
+        formatPicker.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
+        formatPicker.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
+        formatPicker.trailingAnchor.constraint(equalTo: accessoryView.trailingAnchor)
+    ])
+    
+    savePanel.accessoryView = accessoryView
+    savePanel.nameFieldStringValue = "Hal10000_Transcript.\(selectedFormat.fileExtension)"
+    savePanel.title = "Export Conversation"
+    savePanel.allowsOtherFileTypes = false
+    savePanel.isExtensionHidden = false
+    savePanel.allowedContentTypes = [selectedFormat.utType]
+    
+    savePanel.begin { result in
+        currentSavePanel = nil
+        if result == .OK, let url = savePanel.url {
+            switch selectedFormat {
+            case .text:
+                exportPlainTextTranscript(to: url, messages: messages, systemPrompt: systemPrompt)
+            case .thread:
+                exportThreadFile(to: url, messages: messages, systemPrompt: systemPrompt, memoryDepth: memoryDepth, summary: summary)
+            case .dna:
+                exportPersonalityDNA(to: url, systemPrompt: systemPrompt)
+            }
+        }
+    }
+}
+
+// Export function implementations
+private func exportPlainTextTranscript(to url: URL, messages: [ChatMessage], systemPrompt: String) {
+    let sortedMessages = messages.sorted(by: { $0.timestamp < $1.timestamp })
+    
+    var content = "# Hal10000 Conversation Transcript\n"
+    content += "Generated: \(Date().formatted(date: .abbreviated, time: .standard))\n"
+    content += "System Prompt: \(systemPrompt)\n"
+    content += "Total Messages: \(sortedMessages.count)\n\n"
+    content += String(repeating: "=", count: 50) + "\n\n"
+    
+    for (index, message) in sortedMessages.enumerated() {
+        let speaker = message.isFromUser ? "User" : "Assistant"
+        let timestamp = message.timestamp.formatted(date: .abbreviated, time: .shortened)
+        let status = message.isPartial ? " [INCOMPLETE]" : ""
+        
+        content += "[\(index + 1)] \(speaker) - \(timestamp)\(status)\n"
+        content += message.content + "\n\n"
+    }
+    
+    do {
+        try content.write(to: url, atomically: true, encoding: .utf8)
+        print("Successfully exported plain text transcript to \(url.path)")
+    } catch {
+        showErrorAlert("Failed to export transcript: \(error.localizedDescription)")
+    }
+}
+
+private func exportThreadFile(to url: URL, messages: [ChatMessage], systemPrompt: String, memoryDepth: Int, summary: String) {
+    let sortedMessages = messages.sorted(by: { $0.timestamp < $1.timestamp })
+    
+    // Generate conversation title from first user message or use default
+    let title = sortedMessages.first(where: { $0.isFromUser })?.content.prefix(50).description ?? "Hal10000 Conversation"
+    
+    let threadData: [String: Any] = [
+        "formatVersion": "1.0",
+        "title": title,
+        "created": ISO8601DateFormatter().string(from: sortedMessages.first?.timestamp ?? Date()),
+        "memoryDepth": memoryDepth,
+        "summary": summary,
+        "persona": [
+            "name": "Hal10000",
+            "version": "1.0",
+            "systemPrompt": systemPrompt,
+            "settings": [
+                "tone": "curious",
+                "cooperative": true
+            ]
+        ],
+        "messages": sortedMessages.map { message in
+            var messageData: [String: Any] = [
+                "role": message.isFromUser ? "user" : "assistant",
+                "timestamp": ISO8601DateFormatter().string(from: message.timestamp),
+                "content": message.content
+            ]
+            
+            if message.isPartial {
+                messageData["isPartial"] = true
+            }
+            
+            if let duration = message.thinkingDuration {
+                messageData["thinkingDuration"] = duration
+            }
+            
+            return messageData
+        }
+    ]
+    
+    do {
+        let jsonData = try JSONSerialization.data(withJSONObject: threadData, options: .prettyPrinted)
+        try jsonData.write(to: url)
+        print("Successfully exported thread file to \(url.path)")
+    } catch {
+        showErrorAlert("Failed to export thread file: \(error.localizedDescription)")
+    }
+}
+
+private func exportPersonalityDNA(to url: URL, systemPrompt: String) {
+    let dnaData: [String: Any] = [
+        "formatVersion": "1.0",
+        "name": "Hal10000",
+        "systemPrompt": systemPrompt,
+        "settings": [
+            "tone": "curious",
+            "cooperative": true
+        ]
+    ]
+    
+    do {
+        let jsonData = try JSONSerialization.data(withJSONObject: dnaData, options: .prettyPrinted)
+        try jsonData.write(to: url)
+        print("Successfully exported personality DNA to \(url.path)")
+    } catch {
+        showErrorAlert("Failed to export personality DNA: \(error.localizedDescription)")
+    }
+}
+
+private func showErrorAlert(_ message: String) {
+    DispatchQueue.main.async {
+        let alert = NSAlert()
+        alert.messageText = "Export Error"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+}
+
 // ========== BLOCK 6: APP ENTRY POINT - END ==========
