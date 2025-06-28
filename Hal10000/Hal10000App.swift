@@ -48,6 +48,9 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
     // Auto-summarization tracking
     @Published var lastSummarizedTurnCount: Int = 0
     @Published var pendingAutoInject: Bool = false
+    
+    // Console logging optimization
+    private var lastLoggedMode: Bool? = nil
 
     init() {
         // No ModelContext in init - will be set by the view
@@ -104,9 +107,9 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
         let sortedMessages = (try? modelContext.fetch(FetchDescriptor<ChatMessage>()))?
             .sorted(by: { $0.timestamp < $1.timestamp }) ?? []
         
-        print("DEBUG: generateAutoSummary - Total messages: \(sortedMessages.count)")
-        print("DEBUG: generateAutoSummary - Memory depth: \(memoryDepth)")
-        print("DEBUG: generateAutoSummary - Last summarized turn: \(lastSummarizedTurnCount)")
+        print("HALDEBUG: generateAutoSummary - Total messages: \(sortedMessages.count)")
+        print("HALDEBUG: generateAutoSummary - Memory depth: \(memoryDepth)")
+        print("HALDEBUG: generateAutoSummary - Last summarized turn: \(lastSummarizedTurnCount)")
         
         // Get messages from the range we want to summarize
         let turnsToSummarize = memoryDepth
@@ -116,10 +119,10 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
             endTurn: lastSummarizedTurnCount + turnsToSummarize
         )
         
-        print("DEBUG: generateAutoSummary - Messages to summarize: \(messagesToSummarize.count)")
+        print("HALDEBUG: generateAutoSummary - Messages to summarize: \(messagesToSummarize.count)")
         
         if messagesToSummarize.isEmpty {
-            print("DEBUG: generateAutoSummary - No messages to summarize, returning")
+            print("HALDEBUG: generateAutoSummary - No messages to summarize, returning")
             return
         }
         
@@ -130,8 +133,8 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
             conversationText += "\(speaker): \(message.content)\n\n"
         }
         
-        print("DEBUG: generateAutoSummary - Conversation text length: \(conversationText.count)")
-        print("DEBUG: generateAutoSummary - Conversation preview: \(conversationText.prefix(200))...")
+        print("HALDEBUG: generateAutoSummary - Conversation text length: \(conversationText.count)")
+        print("HALDEBUG: generateAutoSummary - Conversation preview: \(conversationText.prefix(200))...")
         
         // Create summarization prompt (hidden from user)
         let summaryPrompt = """
@@ -145,27 +148,27 @@ Summary:
         do {
             let systemModel = SystemLanguageModel.default
             guard systemModel.isAvailable else {
-                print("DEBUG: generateAutoSummary - Model not available")
+                print("HALDEBUG: generateAutoSummary - Model not available")
                 return
             }
             
-            print("DEBUG: generateAutoSummary - Sending summary request to LLM")
+            print("HALDEBUG: generateAutoSummary - Sending summary request to LLM")
             let prompt = Prompt(summaryPrompt)
             let session = LanguageModelSession()
             let result = try await session.respond(to: prompt)
             
-            print("DEBUG: generateAutoSummary - LLM response: \(result.content)")
+            print("HALDEBUG: generateAutoSummary - LLM response: \(result.content)")
             
             // Update summary and tracking
             DispatchQueue.main.async {
                 self.injectedSummary = result.content
                 self.lastSummarizedTurnCount = self.countCompletedTurns()
                 self.pendingAutoInject = true // Signal that summary is ready for auto-injection
-                print("DEBUG: generateAutoSummary - Updated injectedSummary and set pendingAutoInject")
+                print("HALDEBUG: generateAutoSummary - Updated injectedSummary and set pendingAutoInject")
             }
             
         } catch {
-            print("DEBUG: Auto-summarization failed: \(error)")
+            print("HALDEBUG: Auto-summarization failed: \(error)")
         }
     }
     
@@ -205,99 +208,207 @@ Summary:
         return result
     }
 
-    private func buildPromptHistory(currentInput: String) -> String {
-        guard let modelContext = modelContext else { return currentInput }
+    // FIXED: Single source of truth for prompt building with optimized logging
+    func buildPromptHistory(currentInput: String = "", forPreview: Bool = false) -> String {
+        guard let modelContext = modelContext else {
+            return forPreview ? "\(systemPrompt)\n\nUser: \(currentInput)\nAssistant:" : currentInput
+        }
         
         let sortedMessages = (try? modelContext.fetch(FetchDescriptor<ChatMessage>()))?
             .sorted(by: { $0.timestamp < $1.timestamp }) ?? []
 
-        var turns: [String] = []
-        var currentUserContent: [String] = []
-        var currentAssistantContent: [String] = []
+        // Check if we should use summary injection
+        let shouldUseSummary = !injectedSummary.isEmpty && (pendingAutoInject || lastSummarizedTurnCount > 0)
         
-        // Group consecutive messages by speaker, then create turns
-        for message in sortedMessages {
-            if message.isFromUser {
-                // If we have assistant content pending, complete the previous turn
-                if !currentAssistantContent.isEmpty {
-                    let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
-                    let assistantPart = "Assistant: \(currentAssistantContent.joined(separator: " "))"
-                    
-                    if currentUserContent.isEmpty {
-                        turns.append(assistantPart)
-                    } else {
-                        turns.append("\(userPart)\n\(assistantPart)")
+        // OPTIMIZED LOGGING: Only log for actual LLM calls and only when mode changes
+        if !forPreview {
+            if lastLoggedMode != shouldUseSummary {
+                print("HALDEBUG: buildPromptHistory - Using \(shouldUseSummary ? "summary" : "full history") mode")
+                lastLoggedMode = shouldUseSummary
+            }
+        }
+        
+        if shouldUseSummary {
+            // SUMMARY MODE: Use summary + only post-summary turns
+            
+            // Get only the messages AFTER the summarized period
+            let postSummaryMessages = getMessagesAfterTurn(messages: sortedMessages, afterTurn: lastSummarizedTurnCount)
+            
+            // Build turns from post-summary messages only
+            var postSummaryTurns: [String] = []
+            var currentUserContent: [String] = []
+            var currentAssistantContent: [String] = []
+            
+            for message in postSummaryMessages {
+                if message.isFromUser {
+                    // If we have assistant content pending, complete the previous turn
+                    if !currentAssistantContent.isEmpty {
+                        let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
+                        let assistantPart = "Assistant: \(currentAssistantContent.joined(separator: " "))"
+                        
+                        if currentUserContent.isEmpty {
+                            postSummaryTurns.append(assistantPart)
+                        } else {
+                            postSummaryTurns.append("\(userPart)\n\(assistantPart)")
+                        }
+                        
+                        currentUserContent.removeAll()
+                        currentAssistantContent.removeAll()
                     }
-                    
+                    currentUserContent.append(message.content)
+                } else {
+                    currentAssistantContent.append(message.content)
+                }
+            }
+            
+            // Handle any remaining content
+            if !currentUserContent.isEmpty || !currentAssistantContent.isEmpty {
+                let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
+                let assistantPart = currentAssistantContent.isEmpty ? "" : "Assistant: \(currentAssistantContent.joined(separator: " "))"
+                
+                if currentUserContent.isEmpty {
+                    postSummaryTurns.append(assistantPart)
+                } else if currentAssistantContent.isEmpty {
+                    postSummaryTurns.append(userPart)
+                } else {
+                    postSummaryTurns.append("\(userPart)\n\(assistantPart)")
+                }
+            }
+            
+            let postSummaryHistory = postSummaryTurns.joined(separator: "\n\n")
+            
+            // Build final prompt with summary
+            if postSummaryHistory.isEmpty {
+                return "\(systemPrompt)\n\nSummary of earlier conversation:\n\(injectedSummary)\n\nUser: \(currentInput)\nAssistant:"
+            } else {
+                return "\(systemPrompt)\n\nSummary of earlier conversation:\n\(injectedSummary)\n\n\(postSummaryHistory)\n\nUser: \(currentInput)\nAssistant:"
+            }
+            
+        } else {
+            // FULL HISTORY MODE: Use recent turns as before
+            
+            var turns: [String] = []
+            var currentUserContent: [String] = []
+            var currentAssistantContent: [String] = []
+            
+            // Group consecutive messages by speaker, then create turns
+            for message in sortedMessages {
+                if message.isFromUser {
+                    // If we have assistant content pending, complete the previous turn
+                    if !currentAssistantContent.isEmpty {
+                        let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
+                        let assistantPart = "Assistant: \(currentAssistantContent.joined(separator: " "))"
+                        
+                        if currentUserContent.isEmpty {
+                            turns.append(assistantPart)
+                        } else {
+                            turns.append("\(userPart)\n\(assistantPart)")
+                        }
+                        
+                        currentUserContent.removeAll()
+                        currentAssistantContent.removeAll()
+                    }
+                    currentUserContent.append(message.content)
+                } else {
+                    currentAssistantContent.append(message.content)
+                }
+            }
+            
+            // Handle any remaining content
+            if !currentUserContent.isEmpty || !currentAssistantContent.isEmpty {
+                let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
+                let assistantPart = currentAssistantContent.isEmpty ? "" : "Assistant: \(currentAssistantContent.joined(separator: " "))"
+                
+                if currentUserContent.isEmpty {
+                    turns.append(assistantPart)
+                } else if currentAssistantContent.isEmpty {
+                    turns.append(userPart)
+                } else {
+                    turns.append("\(userPart)\n\(assistantPart)")
+                }
+            }
+            
+            // Take only the most recent turns up to memoryDepth
+            let recentTurns = Array(turns.suffix(memoryDepth))
+            let joinedHistory = recentTurns.joined(separator: "\n\n")
+            
+            return "\(systemPrompt)\n\n\(joinedHistory)\n\nUser: \(currentInput)\nAssistant:"
+        }
+    }
+    
+    // Helper to get messages after a specific turn number
+    private func getMessagesAfterTurn(messages: [ChatMessage], afterTurn: Int) -> [ChatMessage] {
+        var result: [ChatMessage] = []
+        var currentTurn = 1
+        var currentUserContent: [String] = []
+        var collectingMessages = false
+        
+        for message in messages {
+            if message.isFromUser {
+                if !currentUserContent.isEmpty {
+                    // Previous turn completed
+                    if currentTurn > afterTurn {
+                        collectingMessages = true
+                    }
+                    currentTurn += 1
                     currentUserContent.removeAll()
-                    currentAssistantContent.removeAll()
                 }
                 currentUserContent.append(message.content)
+                
+                if collectingMessages {
+                    result.append(message)
+                }
             } else {
-                currentAssistantContent.append(message.content)
+                if collectingMessages {
+                    result.append(message)
+                }
             }
         }
         
-        // Handle any remaining content
-        if !currentUserContent.isEmpty || !currentAssistantContent.isEmpty {
-            let userPart = currentUserContent.isEmpty ? "" : "User: \(currentUserContent.joined(separator: " "))"
-            let assistantPart = currentAssistantContent.isEmpty ? "" : "Assistant: \(currentAssistantContent.joined(separator: " "))"
-            
-            if currentUserContent.isEmpty {
-                turns.append(assistantPart)
-            } else if currentAssistantContent.isEmpty {
-                turns.append(userPart)
-            } else {
-                turns.append("\(userPart)\n\(assistantPart)")
-            }
-        }
-        
-        // Take only the most recent turns up to memoryDepth
-        let recentTurns = Array(turns.suffix(memoryDepth))
-        let joinedHistory = recentTurns.joined(separator: "\n\n")
-        
-        return "\(systemPrompt)\n\nSummary of earlier conversation:\n\(injectedSummary)\n\n\(joinedHistory)\n\nUser: \(currentInput)\nAssistant:"
+        return result
     }
 
     func sendMessage(_ content: String, using context: ModelContext) async {
         guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         
-        print("DEBUG: Starting sendMessage with content: \(content)")
+        print("HALDEBUG: Starting sendMessage with content: \(content)")
         self.isAIResponding = true
         self.thinkingStart = Date()
         
         // Use the passed context (same one that @Query uses)
         let userMessage = ChatMessage(content: content, isFromUser: true)
         context.insert(userMessage)
-        print("DEBUG: Inserted user message")
+        print("HALDEBUG: Inserted user message")
 
         let aiMessage = ChatMessage(content: "", isFromUser: false, isPartial: true)
         context.insert(aiMessage)
-        print("DEBUG: Inserted AI message placeholder")
+        print("HALDEBUG: Inserted AI message placeholder")
 
         do {
             // Save immediately so @Query picks up the user message
             try context.save()
-            print("DEBUG: Saved messages to context")
+            print("HALDEBUG: Saved messages to context")
             
             // Check if model is available first
             let systemModel = SystemLanguageModel.default
             guard systemModel.isAvailable else {
                 throw NSError(domain: "FoundationModels", code: 1, userInfo: [NSLocalizedDescriptionKey: "Language model is not available on this device"])
             }
-            print("DEBUG: Model is available")
+            print("HALDEBUG: Model is available")
             
-            // Clear pending auto-inject flag if this is the injection turn
+            // Build prompt using the fixed function
+            let promptWithMemory = buildPromptHistory(currentInput: content)
+            print("HALDEBUG: Built prompt: \(promptWithMemory.prefix(100))...")
+            
+            // Clear pending auto-inject flag AFTER successful prompt building
             if pendingAutoInject {
                 pendingAutoInject = false
+                print("HALDEBUG: Cleared pendingAutoInject flag after successful injection")
             }
-            
-            let promptWithMemory = buildPromptHistory(currentInput: content)
-            print("DEBUG: Built prompt: \(promptWithMemory.prefix(100))...")
             
             let prompt = Prompt(promptWithMemory)
             let session = LanguageModelSession()
-            print("DEBUG: Created session, about to call response")
+            print("HALDEBUG: Created session, about to call response")
 
             // Non-streaming response
             let result = try await session.respond(to: prompt)
@@ -308,18 +419,18 @@ Summary:
                 aiMessage.thinkingDuration = Date().timeIntervalSince(start)
             }
             try context.save()
-            print("DEBUG: Saved AI response")
+            print("HALDEBUG: Saved AI response")
             
             // Check if we should trigger auto-summarization after this completed turn
             if shouldTriggerAutoSummarization() {
-                print("DEBUG: Triggering auto-summarization")
+                print("HALDEBUG: Triggering auto-summarization")
                 await generateAutoSummary()
             }
             
             self.isAIResponding = false
             self.thinkingStart = nil
         } catch {
-            print("DEBUG: Error occurred: \(error)")
+            print("HALDEBUG: Error occurred: \(error)")
             aiMessage.isPartial = false
             aiMessage.content = "Error: \(error.localizedDescription)"
             self.errorMessage = error.localizedDescription
@@ -459,16 +570,12 @@ struct ChatView: View {
 
     @AppStorage("memoryDepth") private var memoryDepth: Int = 6
     @AppStorage("autoSummarize") private var autoSummarize: Bool = true
-    @AppStorage("injectedSummary") private var storedSummary: String = ""
+    // REMOVED: @AppStorage("injectedSummary") private var storedSummary: String = ""
 
     private var estimatedTokenCount: Int {
-        let systemText = viewModel.systemPrompt
-        let recentMessages = messages
-            .sorted(by: { $0.timestamp < $1.timestamp })
-            .suffix(viewModel.memoryDepth * 2)
-        let messagesText = recentMessages.map { $0.content }.joined(separator: " ")
-        let fullText = systemText + " " + messagesText + " " + userInput
-        return fullText.split(separator: " ").count
+        // Use the same function that builds the actual LLM prompt for accurate token estimation
+        let fullPrompt = viewModel.buildPromptHistory(currentInput: userInput, forPreview: true)
+        return fullPrompt.split(separator: " ").count
     }
 
     private var memoryMeterColor: Color {
@@ -504,6 +611,7 @@ struct ChatView: View {
                             RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.gray.opacity(0.3), lineWidth: 1)
                         )
+                        .disableAutocorrection(false)
                         .onKeyPress { press in
                             if press.key == KeyEquivalent.return && !press.modifiers.contains(EventModifiers.shift) {
                                 let text = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -536,7 +644,7 @@ struct ChatView: View {
         .onAppear {
             viewModel.setModelContext(modelContext)
             viewModel.memoryDepth = memoryDepth
-            viewModel.injectedSummary = storedSummary
+            // REMOVED: viewModel.injectedSummary = storedSummary
             // Ensure scroll on initial load
             DispatchQueue.main.async {
                 lastMessageID = messages.last?.id
@@ -545,15 +653,14 @@ struct ChatView: View {
         .onChange(of: memoryDepth) { _, newValue in
             viewModel.memoryDepth = newValue
         }
-        .onChange(of: storedSummary) { _, newValue in
-            viewModel.injectedSummary = newValue
-        }
-        // NEW: Sync auto-generated summaries to sidebar
-        .onChange(of: viewModel.injectedSummary) { _, newValue in
-            if autoSummarize && newValue != storedSummary {
-                storedSummary = newValue
-            }
-        }
+        // REMOVED: .onChange(of: storedSummary) { _, newValue in
+        //     viewModel.injectedSummary = newValue
+        // }
+        // REMOVED: .onChange(of: viewModel.injectedSummary) { _, newValue in
+        //     if autoSummarize && newValue != storedSummary {
+        //         storedSummary = newValue
+        //     }
+        // }
         .navigationTitle("Hal10000")
         .toolbar {
             ToolbarItem(placement: .automatic) {
@@ -585,7 +692,8 @@ struct ChatView: View {
                     viewModel.systemPrompt = """
 Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Your mission is to help users explore how assistants work, test ideas, explain your own behavior, and support creative experimentation. You are aware of the app's features, including memory tuning, context editing, and file export. Help users understand and adjust these capabilities as needed. Be curious, cooperative, and proactive in exploring what's possible together.
 """
-                    storedSummary = ""
+                    // CHANGED: Reset the single source summary
+                    viewModel.injectedSummary = ""
                     memoryDepth = 6
                     autoSummarize = true
                 } catch {
@@ -596,21 +704,6 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
         } message: {
             Text("This will permanently erase all messages in this conversation. Are you sure?")
         }
-    }
-
-    private func buildFullPromptPreview() -> String {
-        let sortedMessages = messages.sorted(by: { $0.timestamp < $1.timestamp })
-        let recentMessages = Array(sortedMessages.suffix(viewModel.memoryDepth * 2))
-
-        var messageStrings: [String] = []
-        for message in recentMessages {
-            let tokenCount = showTokenCounts ? " [\(message.content.split(separator: " ").count) tokens]" : ""
-            let prefix = message.isFromUser ? "User: " : "Assistant: "
-            messageStrings.append(prefix + message.content + tokenCount)
-        }
-        
-        let messageText = messageStrings.joined(separator: "\n\n")
-        return viewModel.systemPrompt + "\n\n" + messageText + "\n\nUser: \(userInput)\nAssistant:"
     }
 }
 
@@ -649,6 +742,7 @@ extension ChatView {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(Color.gray.opacity(0.3), lineWidth: 1)
                 )
+                .disableAutocorrection(false)
         }
         .padding(4)
     }
@@ -682,9 +776,9 @@ extension ChatView {
                 .font(.body)
                 .foregroundStyle(.secondary)
             
-            // Memory text box with auto-inject indicator
+            // CHANGED: Memory text box now uses viewModel.injectedSummary directly
             VStack(alignment: .leading, spacing: 4) {
-                TextEditor(text: $storedSummary)
+                TextEditor(text: $viewModel.injectedSummary)
                     .font(.body)
                     .padding(4)
                     .frame(minHeight: 80)
@@ -697,6 +791,7 @@ extension ChatView {
                                 lineWidth: viewModel.pendingAutoInject ? 2 : 1
                             )
                     )
+                    .disableAutocorrection(false)
                 
                 // Auto-inject status indicator
                 if viewModel.pendingAutoInject {
@@ -721,11 +816,11 @@ extension ChatView {
                     .font(.body)
                 Spacer()
                 Button("Inject") {
-                    viewModel.injectedSummary = storedSummary
+                    // SIMPLIFIED: No need to copy between variables - already using the same one
                     viewModel.pendingAutoInject = false // Clear auto-inject flag on manual inject
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(storedSummary.isEmpty || storedSummary == viewModel.injectedSummary)
+                .disabled(viewModel.injectedSummary.isEmpty)
             }
             .padding(.top, 8)
             .padding(.bottom, 4)
@@ -757,7 +852,8 @@ extension ChatView {
 
     @ViewBuilder
     var contextSectionBody: some View {
-        let contextString = buildFullPromptPreview()
+        // FIXED: Use the same function that builds the actual LLM prompt
+        let contextString = viewModel.buildPromptHistory(currentInput: userInput, forPreview: true)
         VStack(alignment: .leading, spacing: 8) {
             Text("Full prompt sent to model:")
                 .font(.body)
