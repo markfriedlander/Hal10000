@@ -1,4 +1,4 @@
-// ========== BLOCK 1: IMPORTS AND APP ENTRY POINT - START ==========
+// ========== BLOCK 1: IMPORTS AND MEMORY MODELS (ORIGINAL + NEW) - START ==========
 import SwiftUI
 import SwiftData
 import Foundation
@@ -6,12 +6,13 @@ import Combine
 import Observation
 import FoundationModels
 import UniformTypeIdentifiers
-// ========== BLOCK 1: IMPORTS AND APP ENTRY POINT - END ==========
+import SQLite3
+import NaturalLanguage
 
 // Global variable to share ModelContainer for transcript export
 var sharedConversationContext: ModelContainer?
 
-// ========== BLOCK 2: CHAT MESSAGE MODEL - START ==========
+// MARK: - Original ChatMessage Model (KEEP FOR CURRENT SESSION)
 @Model
 final class ChatMessage {
     var id: UUID
@@ -30,9 +31,401 @@ final class ChatMessage {
         self.thinkingDuration = nil
     }
 }
-// ========== BLOCK 2: CHAT MESSAGE MODEL - END ==========
 
-// ========== BLOCK 3: CHAT VIEW MODEL - START ==========
+// MARK: - NEW: Cross-Session SQLite Memory Models
+struct StoredConversation {
+    let id: String
+    let title: String
+    let startedAt: Date
+    let lastActive: Date
+    let turnCount: Int
+    let systemPrompt: String
+    let summary: String
+}
+
+struct StoredMessage {
+    let id: String
+    let conversationId: String
+    let content: String
+    let isFromUser: Bool
+    let timestamp: Date
+    let turnNumber: Int
+    let embedding: [Double]
+}
+
+struct HistoricalContext {
+    let conversationCount: Int
+    let relevantConversations: Int
+    let contextSnippets: [String]
+    let relevanceScores: [Double]
+    let totalTokens: Int
+}
+
+// MARK: - Conversation Memory Store (SQLite-based Cross-Session Memory)
+class ConversationMemoryStore: ObservableObject {
+    static let shared = ConversationMemoryStore()
+    
+    @Published var isEnabled: Bool = true
+    @Published var currentHistoricalContext: HistoricalContext = HistoricalContext(
+        conversationCount: 0,
+        relevantConversations: 0,
+        contextSnippets: [],
+        relevanceScores: [],
+        totalTokens: 0
+    )
+    @Published var totalConversations: Int = 0
+    @Published var totalTurns: Int = 0
+    
+    private var db: OpaquePointer?
+    private let relevanceThreshold: Double = 0.3
+    
+    private init() {
+        setupDatabase()
+        loadStats()
+    }
+    
+    deinit {
+        if db != nil {
+            sqlite3_close(db)
+        }
+    }
+    
+    // Database path
+    private var dbPath: String {
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return documentsPath.appendingPathComponent("hal_conversations.sqlite").path
+    }
+    
+    // Setup SQLite database with conversation schema
+    private func setupDatabase() {
+        let result = sqlite3_open(dbPath, &db)
+        guard result == SQLITE_OK else {
+            print("❌ ConversationMemoryStore: Failed to open database")
+            return
+        }
+        
+        // Enable WAL mode for better performance
+        sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+        
+        // Create conversations table
+        let conversationsSQL = """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            last_active INTEGER NOT NULL,
+            turn_count INTEGER DEFAULT 0,
+            system_prompt TEXT,
+            summary TEXT
+        );
+        """
+        
+        // Create messages table with embeddings
+        let messagesSQL = """
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_from_user INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            turn_number INTEGER NOT NULL,
+            embedding BLOB,
+            FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+        );
+        """
+        
+        // Create indexes for performance
+        let indexSQL = [
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);",
+            "CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);",
+            "CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(is_from_user);",
+            "CREATE INDEX IF NOT EXISTS idx_conversations_active ON conversations(last_active);"
+        ]
+        
+        sqlite3_exec(db, conversationsSQL, nil, nil, nil)
+        sqlite3_exec(db, messagesSQL, nil, nil, nil)
+        
+        for sql in indexSQL {
+            sqlite3_exec(db, sql, nil, nil, nil)
+        }
+        
+        print("✅ ConversationMemoryStore: Database initialized")
+    }
+    
+    // Load global statistics
+    private func loadStats() {
+        guard let db = db else { return }
+        
+        var stmt: OpaquePointer?
+        
+        // Count conversations
+        if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM conversations", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                totalConversations = Int(sqlite3_column_int(stmt, 0))
+            }
+        }
+        sqlite3_finalize(stmt)
+        
+        // Count total turns
+        if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM messages WHERE is_from_user = 1", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                totalTurns = Int(sqlite3_column_int(stmt, 0))
+            }
+        }
+        sqlite3_finalize(stmt)
+        
+        print("📊 ConversationMemoryStore: Loaded \(totalConversations) conversations, \(totalTurns) turns")
+    }
+}
+// ========== BLOCK 1: IMPORTS AND MEMORY MODELS (ORIGINAL + NEW) - END ==========
+
+// ========== BLOCK 2: 4-TIER EMBEDDING SYSTEM AND MEMORY STORE METHODS (FIXED) - START ==========
+
+// MARK: - 4-Tier Embedding System (Apple Foundation → Word → Hash)
+extension ConversationMemoryStore {
+    
+    // Generate embeddings using 4-tier fallback approach (CORRECTED)
+    private func generateEmbedding(for text: String) -> [Double] {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return [] }
+        
+        // Tier 1: Apple Sentence Embeddings (Primary - Best for Conversations)
+        if let embedding = NLEmbedding.sentenceEmbedding(for: .english) {
+            if let vector = embedding.vector(for: cleanText) {
+                let doubleVector = (0..<vector.count).map { Double(vector[$0]) }
+                print("✅ Using Tier 1: Apple Sentence Embeddings (\(doubleVector.count)D)")
+                return doubleVector
+            }
+        }
+        
+        // Tier 2: Apple Word Embeddings (Fallback - SKIP CONTEXTUAL FOR NOW)
+        if let embedding = NLEmbedding.wordEmbedding(for: .english) {
+            let tokenizer = NLTokenizer(unit: .word)
+            tokenizer.string = cleanText
+            
+            var wordVectors: [[Double]] = []
+            tokenizer.enumerateTokens(in: cleanText.startIndex..<cleanText.endIndex) { range, _ in
+                let word = String(cleanText[range]).lowercased()
+                if let vector = embedding.vector(for: word) {
+                    let doubleVector = (0..<vector.count).map { Double(vector[$0]) }
+                    wordVectors.append(doubleVector)
+                }
+                return true
+            }
+            
+            if !wordVectors.isEmpty {
+                let dimensions = wordVectors[0].count
+                var avgVector = Array(repeating: 0.0, count: dimensions)
+                
+                for vector in wordVectors {
+                    for (i, value) in vector.enumerated() {
+                        avgVector[i] += value
+                    }
+                }
+                
+                for i in 0..<avgVector.count {
+                    avgVector[i] /= Double(wordVectors.count)
+                }
+                
+                print("✅ Using Tier 2: Apple Word Embeddings averaged (\(avgVector.count)D)")
+                return avgVector
+            }
+        }
+        
+        // Tier 3: Hash-Based Mathematical Embeddings (Final Fallback)
+        let hashEmbedding = generateHashEmbedding(for: cleanText)
+        print("⚠️ Using Tier 3: Hash-based embeddings (\(hashEmbedding.count)D)")
+        return hashEmbedding
+    }
+    
+    // Generate deterministic hash-based embeddings
+    private func generateHashEmbedding(for text: String) -> [Double] {
+        let normalizedText = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        var embedding: [Double] = []
+        let seeds = [1, 31, 131, 1313, 13131] // Prime-like numbers for hash variation
+        
+        for seed in seeds {
+            let hash = abs(normalizedText.hashValue ^ seed)
+            for i in 0..<13 { // 5 seeds * 13 = 65 dimensions
+                let value = Double((hash >> (i % 32)) & 0xFF) / 255.0
+                embedding.append(value)
+            }
+        }
+        
+        // Normalize to unit vector for cosine similarity
+        let magnitude = sqrt(embedding.map { $0 * $0 }.reduce(0, +))
+        if magnitude > 0 {
+            embedding = embedding.map { $0 / magnitude }
+        }
+        
+        return Array(embedding.prefix(64)) // Keep 64 dimensions for consistency
+    }
+    
+    // Calculate cosine similarity between embeddings
+    private func cosineSimilarity(_ v1: [Double], _ v2: [Double]) -> Double {
+        guard v1.count == v2.count && v1.count > 0 else { return 0 }
+        let dot = zip(v1, v2).map(*).reduce(0, +)
+        let norm1 = sqrt(v1.map { $0 * $0 }.reduce(0, +))
+        let norm2 = sqrt(v2.map { $0 * $0 }.reduce(0, +))
+        return norm1 == 0 || norm2 == 0 ? 0 : dot / (norm1 * norm2)
+    }
+}
+
+// MARK: - Conversation Storage Methods
+extension ConversationMemoryStore {
+    
+    // Store a complete conversation turn (user + assistant message pair)
+    func storeTurn(conversationId: String, userMessage: String, assistantMessage: String, systemPrompt: String, turnNumber: Int) {
+        guard let db = db, isEnabled else { return }
+        
+        let timestamp = Date()
+        let userEmbedding = generateEmbedding(for: userMessage)
+        let assistantEmbedding = generateEmbedding(for: assistantMessage)
+        
+        // Convert embeddings to BLOB data
+        let userBlob = userEmbedding.withUnsafeBufferPointer { Data(buffer: $0) }
+        let assistantBlob = assistantEmbedding.withUnsafeBufferPointer { Data(buffer: $0) }
+        
+        // Insert or update conversation
+        let conversationSQL = """
+        INSERT OR REPLACE INTO conversations (id, title, started_at, last_active, turn_count, system_prompt)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, conversationSQL, -1, &stmt, nil) == SQLITE_OK {
+            let title = userMessage.prefix(50).description // Use first 50 chars as title
+            _ = conversationId.withCString { sqlite3_bind_text(stmt, 1, $0, -1, nil) }
+            _ = title.withCString { sqlite3_bind_text(stmt, 2, $0, -1, nil) }
+            sqlite3_bind_int64(stmt, 3, Int64(timestamp.timeIntervalSince1970))
+            sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
+            sqlite3_bind_int(stmt, 5, Int32(turnNumber))
+            _ = systemPrompt.withCString { sqlite3_bind_text(stmt, 6, $0, -1, nil) }
+            
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+        
+        // Insert user message
+        let userMessageSQL = """
+        INSERT INTO messages (id, conversation_id, content, is_from_user, timestamp, turn_number, embedding)
+        VALUES (?, ?, ?, 1, ?, ?, ?)
+        """
+        
+        if sqlite3_prepare_v2(db, userMessageSQL, -1, &stmt, nil) == SQLITE_OK {
+            let userId = UUID().uuidString
+            _ = userId.withCString { sqlite3_bind_text(stmt, 1, $0, -1, nil) }
+            _ = conversationId.withCString { sqlite3_bind_text(stmt, 2, $0, -1, nil) }
+            _ = userMessage.withCString { sqlite3_bind_text(stmt, 3, $0, -1, nil) }
+            sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
+            sqlite3_bind_int(stmt, 5, Int32(turnNumber))
+            _ = userBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 6, $0.baseAddress, Int32(userBlob.count), nil) }
+            
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+        
+        // Insert assistant message
+        let assistantMessageSQL = """
+        INSERT INTO messages (id, conversation_id, content, is_from_user, timestamp, turn_number, embedding)
+        VALUES (?, ?, ?, 0, ?, ?, ?)
+        """
+        
+        if sqlite3_prepare_v2(db, assistantMessageSQL, -1, &stmt, nil) == SQLITE_OK {
+            let assistantId = UUID().uuidString
+            _ = assistantId.withCString { sqlite3_bind_text(stmt, 1, $0, -1, nil) }
+            _ = conversationId.withCString { sqlite3_bind_text(stmt, 2, $0, -1, nil) }
+            _ = assistantMessage.withCString { sqlite3_bind_text(stmt, 3, $0, -1, nil) }
+            sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
+            sqlite3_bind_int(stmt, 5, Int32(turnNumber))
+            _ = assistantBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 6, $0.baseAddress, Int32(assistantBlob.count), nil) }
+            
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+        
+        // Update stats
+        DispatchQueue.main.async {
+            self.loadStats()
+        }
+        
+        print("💾 Stored turn \(turnNumber) for conversation \(conversationId.prefix(8))...")
+    }
+    
+    // Search for relevant historical context based on user input
+    func searchHistoricalContext(for userInput: String, excludingConversationId: String? = nil) -> HistoricalContext {
+        guard let db = db, isEnabled else {
+            return HistoricalContext(conversationCount: 0, relevantConversations: 0, contextSnippets: [], relevanceScores: [], totalTokens: 0)
+        }
+        
+        let queryEmbedding = generateEmbedding(for: userInput)
+        guard !queryEmbedding.isEmpty else {
+            return HistoricalContext(conversationCount: 0, relevantConversations: 0, contextSnippets: [], relevanceScores: [], totalTokens: 0)
+        }
+        
+        var relevantMessages: [(String, Double, String)] = [] // content, score, conversation_id
+        
+        // Search through all messages (excluding current conversation)
+        var sql = "SELECT content, embedding, conversation_id FROM messages WHERE is_from_user = 1"
+        if let excludeId = excludingConversationId {
+            sql += " AND conversation_id != '\(excludeId)'"
+        }
+        sql += " ORDER BY timestamp DESC LIMIT 500" // Limit for performance
+        
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let contentCString = sqlite3_column_text(stmt, 0),
+                      let conversationIdCString = sqlite3_column_text(stmt, 2) else { continue }
+                
+                let content = String(cString: contentCString)
+                let conversationId = String(cString: conversationIdCString)
+                
+                // Get embedding blob
+                if let embeddingBlob = sqlite3_column_blob(stmt, 1) {
+                    let embeddingSize = sqlite3_column_bytes(stmt, 1)
+                    let embeddingData = Data(bytes: embeddingBlob, count: Int(embeddingSize))
+                    
+                    let embedding = embeddingData.withUnsafeBytes { buffer in
+                        return buffer.bindMemory(to: Double.self).map { $0 }
+                    }
+                    
+                    let similarity = cosineSimilarity(queryEmbedding, embedding)
+                    if similarity > relevanceThreshold {
+                        relevantMessages.append((content, similarity, conversationId))
+                    }
+                }
+            }
+        }
+        sqlite3_finalize(stmt)
+        
+        // Sort by relevance and take top results
+        relevantMessages.sort { $0.1 > $1.1 }
+        let topMessages = Array(relevantMessages.prefix(5))
+        
+        let contextSnippets = topMessages.map { $0.0 }
+        let relevanceScores = topMessages.map { $0.1 }
+        let uniqueConversations = Set(topMessages.map { $0.2 }).count
+        let totalTokens = contextSnippets.joined(separator: " ").split(separator: " ").count
+        
+        let context = HistoricalContext(
+            conversationCount: totalConversations,
+            relevantConversations: uniqueConversations,
+            contextSnippets: contextSnippets,
+            relevanceScores: relevanceScores,
+            totalTokens: totalTokens
+        )
+        
+        print("🔍 Historical search: Found \(topMessages.count) relevant messages from \(uniqueConversations) conversations")
+        return context
+    }
+}
+
+// ========== BLOCK 2: 4-TIER EMBEDDING SYSTEM AND MEMORY STORE METHODS (FIXED) - END ==========
+
+// ========== BLOCK 3: ENHANCED CHATVIEWMODEL WITH HISTORICAL CONTEXT INTEGRATION - START ==========
+
+// MARK: - Enhanced ChatViewModel with Cross-Session Memory
 @MainActor
 class ChatViewModel: ObservableObject {
     @Published var errorMessage: String?
@@ -41,7 +434,7 @@ class ChatViewModel: ObservableObject {
 Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Your mission is to help users explore how assistants work, test ideas, explain your own behavior, and support creative experimentation. You are aware of the app's features, including memory tuning, context editing, and file export. Help users understand and adjust these capabilities as needed. Be curious, cooperative, and proactive in exploring what's possible together.
 """
     @Published var injectedSummary: String = ""
-    @Published var thinkingStart: Date? // NEW
+    @Published var thinkingStart: Date?
     private var modelContext: ModelContext?
     var memoryDepth: Int = 6
     
@@ -49,15 +442,36 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
     @Published var lastSummarizedTurnCount: Int = 0
     @Published var pendingAutoInject: Bool = false
     
-    // Console logging optimization
-    private var lastLoggedMode: Bool? = nil
+    // NEW: Cross-session memory integration
+    private let memoryStore = ConversationMemoryStore.shared
+    private let conversationId = UUID().uuidString // Unique ID for this conversation session
+    @Published var currentHistoricalContext: HistoricalContext = HistoricalContext(
+        conversationCount: 0,
+        relevantConversations: 0,
+        contextSnippets: [],
+        relevanceScores: [],
+        totalTokens: 0
+    )
 
     init() {
         // No ModelContext in init - will be set by the view
+        // Initialize with current memory store stats
+        updateHistoricalStats()
     }
     
     func setModelContext(_ context: ModelContext) {
         self.modelContext = context
+    }
+    
+    // NEW: Update historical context stats for UI display
+    private func updateHistoricalStats() {
+        currentHistoricalContext = HistoricalContext(
+            conversationCount: memoryStore.totalConversations,
+            relevantConversations: 0,
+            contextSnippets: [],
+            relevanceScores: [],
+            totalTokens: 0
+        )
     }
     
     // Count total completed conversation turns
@@ -107,9 +521,9 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
         let sortedMessages = (try? modelContext.fetch(FetchDescriptor<ChatMessage>()))?
             .sorted(by: { $0.timestamp < $1.timestamp }) ?? []
         
-        print("HALDEBUG: generateAutoSummary - Total messages: \(sortedMessages.count)")
-        print("HALDEBUG: generateAutoSummary - Memory depth: \(memoryDepth)")
-        print("HALDEBUG: generateAutoSummary - Last summarized turn: \(lastSummarizedTurnCount)")
+        print("DEBUG: generateAutoSummary - Total messages: \(sortedMessages.count)")
+        print("DEBUG: generateAutoSummary - Memory depth: \(memoryDepth)")
+        print("DEBUG: generateAutoSummary - Last summarized turn: \(lastSummarizedTurnCount)")
         
         // Get messages from the range we want to summarize
         let turnsToSummarize = memoryDepth
@@ -119,10 +533,10 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
             endTurn: lastSummarizedTurnCount + turnsToSummarize
         )
         
-        print("HALDEBUG: generateAutoSummary - Messages to summarize: \(messagesToSummarize.count)")
+        print("DEBUG: generateAutoSummary - Messages to summarize: \(messagesToSummarize.count)")
         
         if messagesToSummarize.isEmpty {
-            print("HALDEBUG: generateAutoSummary - No messages to summarize, returning")
+            print("DEBUG: generateAutoSummary - No messages to summarize, returning")
             return
         }
         
@@ -133,8 +547,8 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
             conversationText += "\(speaker): \(message.content)\n\n"
         }
         
-        print("HALDEBUG: generateAutoSummary - Conversation text length: \(conversationText.count)")
-        print("HALDEBUG: generateAutoSummary - Conversation preview: \(conversationText.prefix(200))...")
+        print("DEBUG: generateAutoSummary - Conversation text length: \(conversationText.count)")
+        print("DEBUG: generateAutoSummary - Conversation preview: \(conversationText.prefix(200))...")
         
         // Create summarization prompt (hidden from user)
         let summaryPrompt = """
@@ -148,27 +562,27 @@ Summary:
         do {
             let systemModel = SystemLanguageModel.default
             guard systemModel.isAvailable else {
-                print("HALDEBUG: generateAutoSummary - Model not available")
+                print("DEBUG: generateAutoSummary - Model not available")
                 return
             }
             
-            print("HALDEBUG: generateAutoSummary - Sending summary request to LLM")
+            print("DEBUG: generateAutoSummary - Sending summary request to LLM")
             let prompt = Prompt(summaryPrompt)
             let session = LanguageModelSession()
             let result = try await session.respond(to: prompt)
             
-            print("HALDEBUG: generateAutoSummary - LLM response: \(result.content)")
+            print("DEBUG: generateAutoSummary - LLM response: \(result.content)")
             
             // Update summary and tracking
             DispatchQueue.main.async {
                 self.injectedSummary = result.content
                 self.lastSummarizedTurnCount = self.countCompletedTurns()
                 self.pendingAutoInject = true // Signal that summary is ready for auto-injection
-                print("HALDEBUG: generateAutoSummary - Updated injectedSummary and set pendingAutoInject")
+                print("DEBUG: generateAutoSummary - Updated injectedSummary and set pendingAutoInject")
             }
             
         } catch {
-            print("HALDEBUG: Auto-summarization failed: \(error)")
+            print("DEBUG: Auto-summarization failed: \(error)")
         }
     }
     
@@ -208,28 +622,47 @@ Summary:
         return result
     }
 
-    // FIXED: Single source of truth for prompt building with optimized logging
+    // ENHANCED: Single source of truth for prompt building with historical context
     func buildPromptHistory(currentInput: String = "", forPreview: Bool = false) -> String {
         guard let modelContext = modelContext else {
-            return forPreview ? "\(systemPrompt)\n\nUser: \(currentInput)\nAssistant:" : currentInput
+            let basePrompt = "\(systemPrompt)\n\nUser: \(currentInput)\nAssistant:"
+            return forPreview ? basePrompt : currentInput
         }
         
         let sortedMessages = (try? modelContext.fetch(FetchDescriptor<ChatMessage>()))?
             .sorted(by: { $0.timestamp < $1.timestamp }) ?? []
 
-        // Check if we should use summary injection
-        let shouldUseSummary = !injectedSummary.isEmpty && (pendingAutoInject || lastSummarizedTurnCount > 0)
-        
-        // OPTIMIZED LOGGING: Only log for actual LLM calls and only when mode changes
-        if !forPreview {
-            if lastLoggedMode != shouldUseSummary {
-                print("HALDEBUG: buildPromptHistory - Using \(shouldUseSummary ? "summary" : "full history") mode")
-                lastLoggedMode = shouldUseSummary
+        // NEW: Search for historical context if enabled
+        var historicalContextText = ""
+        if memoryStore.isEnabled && !currentInput.isEmpty {
+            let historicalContext = memoryStore.searchHistoricalContext(
+                for: currentInput,
+                excludingConversationId: conversationId
+            )
+            
+            // Update UI with found context
+            DispatchQueue.main.async {
+                self.currentHistoricalContext = historicalContext
+            }
+            
+            // Build historical context section if relevant content found
+            if !historicalContext.contextSnippets.isEmpty {
+                historicalContextText = "Previous conversations:\n"
+                for (index, snippet) in historicalContext.contextSnippets.enumerated() {
+                    let score = historicalContext.relevanceScores[index]
+                    historicalContextText += "• \(snippet) (relevance: \(String(format: "%.2f", score)))\n"
+                }
+                historicalContextText += "\n"
+                print("📚 Historical context: \(historicalContext.contextSnippets.count) snippets, \(historicalContext.totalTokens) tokens")
             }
         }
+
+        // Check if we should use summary injection (existing logic)
+        let shouldUseSummary = !injectedSummary.isEmpty && (pendingAutoInject || lastSummarizedTurnCount > 0)
         
         if shouldUseSummary {
             // SUMMARY MODE: Use summary + only post-summary turns
+            print("DEBUG: buildPromptHistory - Using summary mode with historical context")
             
             // Get only the messages AFTER the summarized period
             let postSummaryMessages = getMessagesAfterTurn(messages: sortedMessages, afterTurn: lastSummarizedTurnCount)
@@ -277,15 +710,25 @@ Summary:
             
             let postSummaryHistory = postSummaryTurns.joined(separator: "\n\n")
             
-            // Build final prompt with summary
-            if postSummaryHistory.isEmpty {
-                return "\(systemPrompt)\n\nSummary of earlier conversation:\n\(injectedSummary)\n\nUser: \(currentInput)\nAssistant:"
-            } else {
-                return "\(systemPrompt)\n\nSummary of earlier conversation:\n\(injectedSummary)\n\n\(postSummaryHistory)\n\nUser: \(currentInput)\nAssistant:"
+            // ENHANCED: Build final prompt with historical context + summary
+            var prompt = systemPrompt
+            
+            if !historicalContextText.isEmpty {
+                prompt += "\n\n\(historicalContextText)"
             }
             
+            prompt += "\n\nSummary of earlier conversation:\n\(injectedSummary)"
+            
+            if !postSummaryHistory.isEmpty {
+                prompt += "\n\n\(postSummaryHistory)"
+            }
+            
+            prompt += "\n\nUser: \(currentInput)\nAssistant:"
+            return prompt
+            
         } else {
-            // FULL HISTORY MODE: Use recent turns as before
+            // FULL HISTORY MODE: Use recent turns as before + historical context
+            print("DEBUG: buildPromptHistory - Using full history mode with historical context")
             
             var turns: [String] = []
             var currentUserContent: [String] = []
@@ -332,7 +775,19 @@ Summary:
             let recentTurns = Array(turns.suffix(memoryDepth))
             let joinedHistory = recentTurns.joined(separator: "\n\n")
             
-            return "\(systemPrompt)\n\n\(joinedHistory)\n\nUser: \(currentInput)\nAssistant:"
+            // ENHANCED: Build final prompt with historical context + recent history
+            var prompt = systemPrompt
+            
+            if !historicalContextText.isEmpty {
+                prompt += "\n\n\(historicalContextText)"
+            }
+            
+            if !joinedHistory.isEmpty {
+                prompt += "\n\n\(joinedHistory)"
+            }
+            
+            prompt += "\n\nUser: \(currentInput)\nAssistant:"
+            return prompt
         }
     }
     
@@ -371,44 +826,44 @@ Summary:
     func sendMessage(_ content: String, using context: ModelContext) async {
         guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         
-        print("HALDEBUG: Starting sendMessage with content: \(content)")
+        print("DEBUG: Starting sendMessage with content: \(content)")
         self.isAIResponding = true
         self.thinkingStart = Date()
         
         // Use the passed context (same one that @Query uses)
         let userMessage = ChatMessage(content: content, isFromUser: true)
         context.insert(userMessage)
-        print("HALDEBUG: Inserted user message")
+        print("DEBUG: Inserted user message")
 
         let aiMessage = ChatMessage(content: "", isFromUser: false, isPartial: true)
         context.insert(aiMessage)
-        print("HALDEBUG: Inserted AI message placeholder")
+        print("DEBUG: Inserted AI message placeholder")
 
         do {
             // Save immediately so @Query picks up the user message
             try context.save()
-            print("HALDEBUG: Saved messages to context")
+            print("DEBUG: Saved messages to context")
             
             // Check if model is available first
             let systemModel = SystemLanguageModel.default
             guard systemModel.isAvailable else {
                 throw NSError(domain: "FoundationModels", code: 1, userInfo: [NSLocalizedDescriptionKey: "Language model is not available on this device"])
             }
-            print("HALDEBUG: Model is available")
+            print("DEBUG: Model is available")
             
-            // Build prompt using the fixed function
+            // ENHANCED: Build prompt using the enhanced function with historical context
             let promptWithMemory = buildPromptHistory(currentInput: content)
-            print("HALDEBUG: Built prompt: \(promptWithMemory.prefix(100))...")
+            print("DEBUG: Built prompt with historical context: \(promptWithMemory.prefix(100))...")
             
             // Clear pending auto-inject flag AFTER successful prompt building
             if pendingAutoInject {
                 pendingAutoInject = false
-                print("HALDEBUG: Cleared pendingAutoInject flag after successful injection")
+                print("DEBUG: Cleared pendingAutoInject flag after successful injection")
             }
             
             let prompt = Prompt(promptWithMemory)
             let session = LanguageModelSession()
-            print("HALDEBUG: Created session, about to call response")
+            print("DEBUG: Created session, about to call response")
 
             // Non-streaming response
             let result = try await session.respond(to: prompt)
@@ -419,18 +874,32 @@ Summary:
                 aiMessage.thinkingDuration = Date().timeIntervalSince(start)
             }
             try context.save()
-            print("HALDEBUG: Saved AI response")
+            print("DEBUG: Saved AI response")
+            
+            // NEW: Store completed turn in long-term memory
+            let currentTurnNumber = countCompletedTurns()
+            memoryStore.storeTurn(
+                conversationId: conversationId,
+                userMessage: content,
+                assistantMessage: response,
+                systemPrompt: systemPrompt,
+                turnNumber: currentTurnNumber
+            )
+            print("💾 Stored turn \(currentTurnNumber) in long-term memory")
+            
+            // Update historical stats for UI
+            updateHistoricalStats()
             
             // Check if we should trigger auto-summarization after this completed turn
             if shouldTriggerAutoSummarization() {
-                print("HALDEBUG: Triggering auto-summarization")
+                print("DEBUG: Triggering auto-summarization")
                 await generateAutoSummary()
             }
             
             self.isAIResponding = false
             self.thinkingStart = nil
         } catch {
-            print("HALDEBUG: Error occurred: \(error)")
+            print("DEBUG: Error occurred: \(error)")
             aiMessage.isPartial = false
             aiMessage.content = "Error: \(error.localizedDescription)"
             self.errorMessage = error.localizedDescription
@@ -440,7 +909,8 @@ Summary:
         }
     }
 }
-// ========== BLOCK 3: CHAT VIEW MODEL - END ==========
+
+// ========== BLOCK 3: ENHANCED CHATVIEWMODEL WITH HISTORICAL CONTEXT INTEGRATION - END ==========
 
 // ========== BLOCK 4: CHAT BUBBLE VIEW - START ==========
 struct ChatBubbleView: View {
@@ -562,20 +1032,29 @@ struct ChatView: View {
     @StateObject private var viewModel = ChatViewModel()
     @State private var isShowingDebugger: Bool = false
     @AppStorage("isShowingBehavior") private var isShowingBehavior: Bool = false
-    @AppStorage("isShowingMemory") private var isShowingMemory: Bool = false
+    @AppStorage("isShowingLongTermMemory") private var isShowingLongTermMemory: Bool = true
+    @AppStorage("isShowingShortTermMemory") private var isShowingShortTermMemory: Bool = true
+    @AppStorage("longTermMemoryEnabled") private var longTermMemoryEnabled: Bool = true
     @State private var showTokenCounts: Bool = false
     @State private var scrollTrigger = UUID()
     @State private var lastMessageID: UUID? = nil
     @State private var showResetConfirmation = false
+    @StateObject private var memoryStore = ConversationMemoryStore.shared
 
     @AppStorage("memoryDepth") private var memoryDepth: Int = 6
     @AppStorage("autoSummarize") private var autoSummarize: Bool = true
-    // REMOVED: @AppStorage("injectedSummary") private var storedSummary: String = ""
 
     private var estimatedTokenCount: Int {
-        // Use the same function that builds the actual LLM prompt for accurate token estimation
         let fullPrompt = viewModel.buildPromptHistory(currentInput: userInput, forPreview: true)
         return fullPrompt.split(separator: " ").count
+    }
+
+    private var historicalTokenCount: Int {
+        return viewModel.currentHistoricalContext.totalTokens
+    }
+
+    private var recentTokenCount: Int {
+        return estimatedTokenCount - historicalTokenCount
     }
 
     private var memoryMeterColor: Color {
@@ -591,7 +1070,8 @@ struct ChatView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     behaviorSection
-                    memorySection
+                    longTermMemorySection
+                    shortTermMemorySection
                     contextSection
                 }
                 .padding()
@@ -644,8 +1124,6 @@ struct ChatView: View {
         .onAppear {
             viewModel.setModelContext(modelContext)
             viewModel.memoryDepth = memoryDepth
-            // REMOVED: viewModel.injectedSummary = storedSummary
-            // Ensure scroll on initial load
             DispatchQueue.main.async {
                 lastMessageID = messages.last?.id
             }
@@ -653,21 +1131,23 @@ struct ChatView: View {
         .onChange(of: memoryDepth) { _, newValue in
             viewModel.memoryDepth = newValue
         }
-        // REMOVED: .onChange(of: storedSummary) { _, newValue in
-        //     viewModel.injectedSummary = newValue
-        // }
-        // REMOVED: .onChange(of: viewModel.injectedSummary) { _, newValue in
-        //     if autoSummarize && newValue != storedSummary {
-        //         storedSummary = newValue
-        //     }
-        // }
+        .onChange(of: longTermMemoryEnabled) { _, newValue in
+            memoryStore.isEnabled = newValue
+        }
         .navigationTitle("Hal10000")
         .toolbar {
             ToolbarItem(placement: .automatic) {
-                Text("Memory Meter: ~\(estimatedTokenCount)")
-                    .font(.callout)
-                    .foregroundStyle(memoryMeterColor)
-                    .help("Estimated total tokens currently in memory (system prompt + chat)")
+                if historicalTokenCount > 0 {
+                    Text("Memory Meter: ~\(estimatedTokenCount) tokens (\(recentTokenCount) recent + \(historicalTokenCount) historical)")
+                        .font(.callout)
+                        .foregroundStyle(memoryMeterColor)
+                        .help("Estimated total tokens currently in memory")
+                } else {
+                    Text("Memory Meter: ~\(estimatedTokenCount) tokens")
+                        .font(.callout)
+                        .foregroundStyle(memoryMeterColor)
+                        .help("Estimated total tokens currently in memory")
+                }
             }
         }
         .alert("Error", isPresented: Binding(get: {
@@ -692,7 +1172,6 @@ struct ChatView: View {
                     viewModel.systemPrompt = """
 Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Your mission is to help users explore how assistants work, test ideas, explain your own behavior, and support creative experimentation. You are aware of the app's features, including memory tuning, context editing, and file export. Help users understand and adjust these capabilities as needed. Be curious, cooperative, and proactive in exploring what's possible together.
 """
-                    // CHANGED: Reset the single source summary
                     viewModel.injectedSummary = ""
                     memoryDepth = 6
                     autoSummarize = true
@@ -704,6 +1183,55 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
         } message: {
             Text("This will permanently erase all messages in this conversation. Are you sure?")
         }
+    }
+    
+    private func debugDatabase() {
+        print("HALDEBUG: === DATABASE DEBUG START ===")
+        print("HALDEBUG: Memory store enabled: \(memoryStore.isEnabled)")
+        print("HALDEBUG: Total conversations: \(memoryStore.totalConversations)")
+        print("HALDEBUG: Total turns: \(memoryStore.totalTurns)")
+        
+        // Try to access the database directly
+        let dbPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("hal_conversations.sqlite").path
+        
+        print("HALDEBUG: Database path: \(dbPath)")
+        print("HALDEBUG: Database exists: \(FileManager.default.fileExists(atPath: dbPath))")
+        
+        // Check if we can open the database
+        var db: OpaquePointer?
+        if sqlite3_open(dbPath, &db) == SQLITE_OK {
+            print("HALDEBUG: Database opened successfully")
+            
+            // Check conversations table
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM conversations", -1, &stmt, nil) == SQLITE_OK {
+                if sqlite3_step(stmt) == SQLITE_ROW {
+                    let conversationCount = sqlite3_column_int(stmt, 0)
+                    print("HALDEBUG: Conversations in database: \(conversationCount)")
+                }
+            } else {
+                print("HALDEBUG: Failed to prepare conversations query")
+            }
+            sqlite3_finalize(stmt)
+            
+            // Check messages table
+            if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM messages", -1, &stmt, nil) == SQLITE_OK {
+                if sqlite3_step(stmt) == SQLITE_ROW {
+                    let messageCount = sqlite3_column_int(stmt, 0)
+                    print("HALDEBUG: Messages in database: \(messageCount)")
+                }
+            } else {
+                print("HALDEBUG: Failed to prepare messages query")
+            }
+            sqlite3_finalize(stmt)
+            
+            sqlite3_close(db)
+        } else {
+            print("HALDEBUG: Failed to open database")
+        }
+        
+        print("HALDEBUG: === DATABASE DEBUG END ===")
     }
 }
 
@@ -753,11 +1281,11 @@ extension ChatView {
     }
 
     @ViewBuilder
-    var memorySection: some View {
-        DisclosureGroup(isExpanded: $isShowingMemory) {
-            memorySectionBody
+    var longTermMemorySection: some View {
+        DisclosureGroup(isExpanded: $isShowingLongTermMemory) {
+            longTermMemorySectionBody
         } label: {
-            memorySectionLabel
+            longTermMemorySectionLabel
         }
         .font(.body)
         .padding(.vertical, 2)
@@ -770,13 +1298,70 @@ extension ChatView {
     }
 
     @ViewBuilder
-    var memorySectionBody: some View {
+    var longTermMemorySectionBody: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Historical Context:")
+                .font(.body)
+                .foregroundStyle(.secondary)
+            
+            TextEditor(text: .constant(viewModel.currentHistoricalContext.contextSnippets.joined(separator: "\n\n")))
+                .font(.body)
+                .padding(4)
+                .frame(minHeight: 80)
+                .background(Color.gray.opacity(0.05))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                )
+                .disabled(true)
+            
+            Text("Global: \(memoryStore.totalConversations) Conversations | \(memoryStore.totalTurns) Turns, Relevant: \(viewModel.currentHistoricalContext.relevantConversations) Conversations | \(viewModel.currentHistoricalContext.contextSnippets.count) Turns")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            
+            Toggle("Auto-Injection", isOn: $longTermMemoryEnabled)
+                .font(.body)
+        }
+        .padding(4)
+    }
+
+    var longTermMemorySectionLabel: some View {
+        HStack {
+            Text("Memory: Long Term")
+                .font(.title3)
+            if !longTermMemoryEnabled {
+                Text("(Disabled)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    var shortTermMemorySection: some View {
+        DisclosureGroup(isExpanded: $isShowingShortTermMemory) {
+            shortTermMemorySectionBody
+        } label: {
+            shortTermMemorySectionLabel
+        }
+        .font(.body)
+        .padding(.vertical, 2)
+        .background(Color.gray.opacity(0.04))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.gray.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    var shortTermMemorySectionBody: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Summary:")
                 .font(.body)
                 .foregroundStyle(.secondary)
             
-            // CHANGED: Memory text box now uses viewModel.injectedSummary directly
             VStack(alignment: .leading, spacing: 4) {
                 TextEditor(text: $viewModel.injectedSummary)
                     .font(.body)
@@ -793,7 +1378,6 @@ extension ChatView {
                     )
                     .disableAutocorrection(false)
                 
-                // Auto-inject status indicator
                 if viewModel.pendingAutoInject {
                     HStack(spacing: 4) {
                         Image(systemName: "arrow.up.circle.fill")
@@ -810,14 +1394,16 @@ extension ChatView {
                 .font(.body)
                 .padding(.vertical, 2)
             
-            // Unified button group for memory section
             HStack {
                 Toggle("Auto-summarize", isOn: $autoSummarize)
                     .font(.body)
                 Spacer()
+                Button("Debug DB") {
+                    debugDatabase()
+                }
+                .buttonStyle(.bordered)
                 Button("Inject") {
-                    // SIMPLIFIED: No need to copy between variables - already using the same one
-                    viewModel.pendingAutoInject = false // Clear auto-inject flag on manual inject
+                    viewModel.pendingAutoInject = false
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(viewModel.injectedSummary.isEmpty)
@@ -828,8 +1414,8 @@ extension ChatView {
         .padding(4)
     }
 
-    var memorySectionLabel: some View {
-        Text("Memory")
+    var shortTermMemorySectionLabel: some View {
+        Text("Memory: Short Term")
             .font(.title3)
     }
 
@@ -852,7 +1438,6 @@ extension ChatView {
 
     @ViewBuilder
     var contextSectionBody: some View {
-        // FIXED: Use the same function that builds the actual LLM prompt
         let contextString = viewModel.buildPromptHistory(currentInput: userInput, forPreview: true)
         VStack(alignment: .leading, spacing: 8) {
             Text("Full prompt sent to model:")
