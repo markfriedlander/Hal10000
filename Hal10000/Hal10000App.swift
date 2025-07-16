@@ -64,76 +64,6 @@ enum ContentSourceType: String, CaseIterable, Codable {
     }
 }
 
-struct NamedEntity: Codable, Hashable {
-    let text: String
-    let type: EntityType
-    let range: NSRange
-    let confidence: Double
-    
-    enum EntityType: String, Codable, CaseIterable {
-        case person = "person"
-        case place = "place"
-        case organization = "org"
-        case other = "other"
-        
-        var displayName: String {
-            switch self {
-            case .person: return "Person"
-            case .place: return "Place"
-            case .organization: return "Organization"
-            case .other: return "Other"
-            }
-        }
-        
-        var icon: String {
-        switch self {
-            case .person: return "👤"
-            case .place: return "📍"
-            case .organization: return "🏢"
-            case .other: return "🏷️"
-            }
-        }
-    }
-    
-    init(text: String, type: EntityType, range: NSRange, confidence: Double = 1.0) {
-        self.text = text
-        self.type = type
-        self.range = range
-        self.confidence = confidence
-    }
-    
-    // Coding keys for proper JSON serialization
-    enum CodingKeys: String, CodingKey {
-        case text, type, range, confidence
-    }
-    
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        text = try container.decode(String.self, forKey: .text)
-        type = try container.decode(EntityType.self, forKey: .type)
-        confidence = try container.decodeIfPresent(Double.self, forKey: .confidence) ?? 1.0
-        
-        // Handle NSRange decoding
-        if let rangeData = try container.decodeIfPresent(Data.self, forKey: .range) {
-            range = try NSKeyedUnarchiver.unarchivedObject(ofClass: NSValue.self, from: rangeData)?.rangeValue ?? NSRange(location: 0, length: 0)
-        } else {
-            range = NSRange(location: 0, length: text.count)
-        }
-    }
-    
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(text, forKey: .text)
-        try container.encode(type, forKey: .type)
-        try container.encode(confidence, forKey: .confidence)
-        
-        // Handle NSRange encoding
-        let rangeValue = NSValue(range: range)
-        let rangeData = try NSKeyedArchiver.archivedData(withRootObject: rangeValue, requiringSecureCoding: false)
-        try container.encode(rangeData, forKey: .range)
-    }
-}
-
 // MARK: - Memory Store with Persistent Database Connection
 class MemoryStore: ObservableObject {
     static let shared = MemoryStore()
@@ -155,7 +85,7 @@ class MemoryStore: ObservableObject {
     // Persistent database connection - no more open/close every operation
     private var db: OpaquePointer?
     private var isConnected: Bool = false
-    private let relevanceThreshold: Double = 0.3
+    private let relevanceThreshold: Double = 0.65
     
     private init() {
         print("HALDEBUG-DATABASE: MemoryStore initializing with persistent connection...")
@@ -315,14 +245,14 @@ class MemoryStore: ObservableObject {
         return isConnected
     }
     
-    // Create proper unified schema with working constraints
+    // Create simplified unified schema - MATCHES Block 9 exactly
     private func createUnifiedSchema() {
         guard ensureHealthyConnection() else {
             print("HALDEBUG-DATABASE: ❌ Cannot create schema - no database connection")
             return
         }
         
-        print("HALDEBUG-DATABASE: Creating unified database schema...")
+        print("HALDEBUG-DATABASE: Creating simplified unified database schema...")
         
         // Create sources table first (no dependencies)
         let sourcesSQL = """
@@ -335,14 +265,13 @@ class MemoryStore: ObservableObject {
             created_at INTEGER NOT NULL,
             last_updated INTEGER NOT NULL,
             total_chunks INTEGER DEFAULT 0,
-            total_entities INTEGER DEFAULT 0,
             metadata_json TEXT,
             content_hash TEXT,
             file_size INTEGER DEFAULT 0
         );
         """
         
-        // Unified content table with proper structure
+        // SCHEMA ALIGNED TO BLOCK 9: This exactly matches what Block 9 expects
         let unifiedContentSQL = """
         CREATE TABLE IF NOT EXISTS unified_content (
             id TEXT PRIMARY KEY,
@@ -353,38 +282,16 @@ class MemoryStore: ObservableObject {
             source_id TEXT NOT NULL,
             position INTEGER NOT NULL,
             is_from_user INTEGER,
-            entity_count INTEGER DEFAULT 0,
-            content_hash TEXT,
             metadata_json TEXT,
             created_at INTEGER DEFAULT (strftime('%s', 'now')),
             UNIQUE(source_type, source_id, position)
         );
         """
         
-        // Entities table with proper structure
-        let unifiedEntitiesSQL = """
-        CREATE TABLE IF NOT EXISTS unified_entities (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_text TEXT NOT NULL,
-            entity_type TEXT NOT NULL,
-            content_id TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            source_id TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            entity_range_start INTEGER,
-            entity_range_length INTEGER,
-            confidence REAL DEFAULT 1.0,
-            created_at INTEGER DEFAULT (strftime('%s', 'now')),
-            UNIQUE(entity_text, content_id, entity_type),
-            FOREIGN KEY (content_id) REFERENCES unified_content(id) ON DELETE CASCADE
-        );
-        """
-        
         // Execute schema creation with proper error handling
         let tables = [
             ("sources", sourcesSQL),
-            ("unified_content", unifiedContentSQL),
-            ("unified_entities", unifiedEntitiesSQL)
+            ("unified_content", unifiedContentSQL)
         ]
         
         for (tableName, sql) in tables {
@@ -396,14 +303,11 @@ class MemoryStore: ObservableObject {
             }
         }
         
-        // Create performance indexes
+        // Create simplified performance indexes
         let unifiedIndexes = [
             "CREATE INDEX IF NOT EXISTS idx_unified_content_source ON unified_content(source_type, source_id);",
             "CREATE INDEX IF NOT EXISTS idx_unified_content_timestamp ON unified_content(timestamp);",
             "CREATE INDEX IF NOT EXISTS idx_unified_content_from_user ON unified_content(is_from_user);",
-            "CREATE INDEX IF NOT EXISTS idx_unified_entities_text ON unified_entities(entity_text);",
-            "CREATE INDEX IF NOT EXISTS idx_unified_entities_type ON unified_entities(entity_type);",
-            "CREATE INDEX IF NOT EXISTS idx_unified_entities_content ON unified_entities(content_id);",
             "CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(source_type);"
         ]
         
@@ -415,7 +319,7 @@ class MemoryStore: ObservableObject {
             }
         }
         
-        print("HALDEBUG-DATABASE: ✅ Unified schema creation complete")
+        print("HALDEBUG-DATABASE: ✅ Simplified unified schema creation complete")
     }
     
     // ENCRYPTION: Enable Apple Data Protection on database file
@@ -434,7 +338,7 @@ class MemoryStore: ObservableObject {
         #endif
     }
     
-    // Corrected statistics queries with proper error handling
+    // FIXED: Statistics queries updated to match actual schema columns
     private func loadUnifiedStats() {
         guard ensureHealthyConnection() else {
             print("HALDEBUG-DATABASE: ❌ Cannot load stats - no database connection")
@@ -449,7 +353,7 @@ class MemoryStore: ObservableObject {
         var tempTotalDocuments = 0
         var tempTotalDocumentChunks = 0
         
-        // Count conversations properly
+        // FIXED: Count conversations using actual schema
         let conversationCountSQL = "SELECT COUNT(DISTINCT source_id) FROM unified_content WHERE source_type = 'conversation'"
         if sqlite3_prepare_v2(db, conversationCountSQL, -1, &stmt, nil) == SQLITE_OK {
             if sqlite3_step(stmt) == SQLITE_ROW {
@@ -462,7 +366,7 @@ class MemoryStore: ObservableObject {
         }
         sqlite3_finalize(stmt)
         
-        // Count user turns properly (user messages only)
+        // FIXED: Count user turns using actual schema (user messages only)
         let userTurnsSQL = "SELECT COUNT(*) FROM unified_content WHERE source_type = 'conversation' AND is_from_user = 1"
         if sqlite3_prepare_v2(db, userTurnsSQL, -1, &stmt, nil) == SQLITE_OK {
             if sqlite3_step(stmt) == SQLITE_ROW {
@@ -475,21 +379,27 @@ class MemoryStore: ObservableObject {
         }
         sqlite3_finalize(stmt)
         
-        // Count documents in sources
+        // FIXED: Count documents in sources table
         if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM sources WHERE source_type = 'document'", -1, &stmt, nil) == SQLITE_OK {
             if sqlite3_step(stmt) == SQLITE_ROW {
                 tempTotalDocuments = Int(sqlite3_column_int(stmt, 0))
                 print("HALDEBUG-DATABASE: Found \(tempTotalDocuments) documents")
             }
+        } else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            print("HALDEBUG-DATABASE: ❌ Failed to count documents: \(errorMessage)")
         }
         sqlite3_finalize(stmt)
         
-        // Count document chunks in unified_content
+        // FIXED: Count document chunks in unified_content
         if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM unified_content WHERE source_type = 'document'", -1, &stmt, nil) == SQLITE_OK {
             if sqlite3_step(stmt) == SQLITE_ROW {
                 tempTotalDocumentChunks = Int(sqlite3_column_int(stmt, 0))
                 print("HALDEBUG-DATABASE: Found \(tempTotalDocumentChunks) document chunks")
             }
+        } else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            print("HALDEBUG-DATABASE: ❌ Failed to count document chunks: \(errorMessage)")
         }
         sqlite3_finalize(stmt)
         
@@ -538,6 +448,7 @@ class MemoryStore: ObservableObject {
     }
 }
 // ========== BLOCK 1: MEMORY MODELS AND DATABASE SETUP - END ==========
+
 
 
 // ========== BLOCK 2: SIMPLIFIED EMBEDDING SYSTEM (MENTAT-PROVEN APPROACH) - START ==========
@@ -869,7 +780,7 @@ extension DocumentImportManager {
 // ========== BLOCK 3: ENHANCED CONTENT PROCESSING WITH MENTAT'S PROVEN CHUNKING - END ==========
 
 
-// ========== BLOCK 4: ARRAY-BASED CHATVIEWMODEL WITH PERSISTENCE - START ==========
+// ========== BLOCK 4: ARRAY-BASED CHATVIEWMODEL WITH CORRECT MEMORY LOGIC - START ==========
 
 // MARK: - Simple ChatMessage Model (No SwiftData)
 struct ChatMessage: Identifiable {
@@ -889,11 +800,10 @@ struct ChatMessage: Identifiable {
     }
 }
 
-// MARK: - Unified Search Context Model
+// MARK: - Simplified Search Context Model (Entity-Free)
 struct UnifiedSearchContext {
     let conversationSnippets: [String]
     let documentSnippets: [String]
-    let entityMatches: [String]
     let relevanceScores: [Double]
     let totalTokens: Int
     
@@ -906,7 +816,7 @@ struct UnifiedSearchContext {
     }
 }
 
-// MARK: - Array-Based ChatViewModel with Conversation Persistence
+// MARK: - Array-Based ChatViewModel with Fixed Memory Logic
 @MainActor
 class ChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
@@ -923,7 +833,7 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
     @Published var lastSummarizedTurnCount: Int = 0
     @Published var pendingAutoInject: Bool = false
     
-    // Unified memory integration
+    // Unified memory integration (entity-free)
     private let memoryStore = MemoryStore.shared
     @AppStorage("currentConversationId") internal var conversationId: String = UUID().uuidString
     @Published var currentHistoricalContext: HistoricalContext = HistoricalContext(
@@ -936,13 +846,9 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
     @Published var currentUnifiedContext: UnifiedSearchContext = UnifiedSearchContext(
         conversationSnippets: [],
         documentSnippets: [],
-        entityMatches: [],
         relevanceScores: [],
         totalTokens: 0
     )
-
-    // SURGICAL DEBUG FLAG - FOR SEARCH DEBUGGING ONLY
-    private let SEARCH_DEBUG = true
 
     init() {
         print("HALDEBUG-UI: ChatViewModel initializing with conversation ID: \(conversationId)")
@@ -1180,160 +1086,121 @@ Summary:
         return result
     }
 
-    // Build prompt history with proper short-term and long-term memory integration
+    // FIXED: Simplified prompt building with correct memory logic
     func buildPromptHistory(currentInput: String = "", forPreview: Bool = false) -> String {
-        // SURGICAL DEBUG - START
-        if SEARCH_DEBUG { print("SURGERY-DEBUG: buildPromptHistory called with input: '\(currentInput.prefix(30))...', forPreview: \(forPreview)") }
-        
         print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))...'")
         
-        // Get all messages sorted by timestamp
-        let allMessages = messages.sorted(by: { $0.timestamp < $1.timestamp })
-        print("HALDEBUG-MEMORY: Found \(allMessages.count) total messages in array")
+        let currentTurns = countCompletedTurns()
+        print("HALDEBUG-MEMORY: Current turns: \(currentTurns), Memory depth: \(memoryDepth), Last summarized: \(lastSummarizedTurnCount)")
         
-        // Search for long-term memory context ONLY for actual messages, not preview
-        var unifiedContextText = ""
+        // STEP 1: Calculate what should be in short-term memory
+        let shortTermTurns = getShortTermTurns(currentTurns: currentTurns)
+        print("HALDEBUG-MEMORY: Short-term should include turns: \(shortTermTurns)")
+        
+        // STEP 2: Get long-term search results (excluding short-term content)
+        var longTermSearchText = ""
         if memoryStore.isEnabled && !currentInput.isEmpty && !forPreview {
-            // SURGICAL DEBUG - SEARCH TRIGGER CONDITIONS
-            if SEARCH_DEBUG { print("SURGERY-DEBUG: Search trigger conditions met - memoryStore.isEnabled: \(memoryStore.isEnabled), currentInput.isEmpty: \(currentInput.isEmpty), forPreview: \(forPreview)") }
-            if SEARCH_DEBUG { print("SURGERY-DEBUG: About to call searchUnifiedContent for query: '\(currentInput)'") }
-            
-            print("HALDEBUG-MEMORY: Performing unified search for: '\(currentInput)'")
-            let unifiedContext = memoryStore.searchUnifiedContent(
+            print("HALDEBUG-MEMORY: Performing long-term search excluding short-term turns: \(shortTermTurns)")
+            let searchContext = memoryStore.searchUnifiedContent(
                 for: currentInput,
                 currentConversationId: conversationId,
-                excludingRecentTurns: memoryDepth,
+                excludeTurns: shortTermTurns,
                 maxResults: 5
             )
             
-            // SURGICAL DEBUG - SEARCH RESULTS
-            if SEARCH_DEBUG { print("SURGERY-DEBUG: searchUnifiedContent returned - conversationSnippets: \(unifiedContext.conversationSnippets.count), documentSnippets: \(unifiedContext.documentSnippets.count), totalSnippets: \(unifiedContext.totalSnippets)") }
-            
             // Update UI with found context
             DispatchQueue.main.async {
-                self.currentUnifiedContext = unifiedContext
+                self.currentUnifiedContext = searchContext
             }
             
-            // Build unified context section if relevant content found
-            if !unifiedContext.conversationSnippets.isEmpty || !unifiedContext.documentSnippets.isEmpty {
-                if SEARCH_DEBUG { print("SURGERY-DEBUG: Building unified context text from search results") }
-                unifiedContextText = "Relevant context from your memory:\n"
-                
-                // Add conversation context
-                for snippet in unifiedContext.conversationSnippets {
-                    if SEARCH_DEBUG { print("SURGERY-DEBUG: Conversation snippet: '\(snippet.prefix(150))...'") }
-                    unifiedContextText += "• From past conversation: \(snippet.prefix(200))...\n"
+            // Format search results
+            if searchContext.hasContent {
+                longTermSearchText = "Relevant information from your knowledge:\n"
+                for snippet in searchContext.conversationSnippets + searchContext.documentSnippets {
+                    longTermSearchText += "- \(snippet.prefix(200))...\n"
                 }
-                
-                // Add document context
-                for snippet in unifiedContext.documentSnippets {
-                    if SEARCH_DEBUG { print("SURGERY-DEBUG: Document snippet: '\(snippet.prefix(150))...'") }
-                    unifiedContextText += "• From document: \(snippet.prefix(200))...\n"
-                }
-                
-                // Add entity matches
-                if !unifiedContext.entityMatches.isEmpty {
-                    unifiedContextText += "Related entities: \(unifiedContext.entityMatches.joined(separator: ", "))\n"
-                }
-                
-                unifiedContextText += "\n"
-                print("HALDEBUG-MEMORY: Added unified context: \(unifiedContext.conversationSnippets.count) conversation + \(unifiedContext.documentSnippets.count) document snippets")
-            } else {
-                if SEARCH_DEBUG { print("SURGERY-DEBUG: No unified context found - search returned empty results") }
-                print("HALDEBUG-MEMORY: No unified context found for query")
+                longTermSearchText += "\n"
+                print("HALDEBUG-MEMORY: Added long-term search: \(searchContext.conversationSnippets.count) conversation + \(searchContext.documentSnippets.count) document snippets")
             }
-        } else {
-            // SURGICAL DEBUG - SEARCH NOT TRIGGERED
-            if SEARCH_DEBUG { print("SURGERY-DEBUG: Search NOT triggered - memoryStore.isEnabled: \(memoryStore.isEnabled), currentInput.isEmpty: \(currentInput.isEmpty), forPreview: \(forPreview)") }
         }
-        // SURGICAL DEBUG - END
         
-        // Determine if we should use summary mode based on turn count and summary availability
-        let currentTurns = countCompletedTurns()
-        let shouldUseSummary = !injectedSummary.isEmpty && currentTurns > memoryDepth
+        // STEP 3: Get short-term verbatim messages
+        let shortTermMessages = getShortTermMessages(turns: shortTermTurns)
+        let shortTermText = formatMessagesAsHistory(shortTermMessages)
+        print("HALDEBUG-MEMORY: Short-term verbatim: \(shortTermMessages.count) messages from turns \(shortTermTurns)")
         
-        if shouldUseSummary {
-            print("HALDEBUG-MEMORY: Using summary mode - \(injectedSummary.count) characters of summary")
-            
-            // Get only the most recent messages within memory depth
-            let recentMessages = getRecentMessagesWithinDepth(allMessages, depth: memoryDepth)
-            print("HALDEBUG-MEMORY: Using \(recentMessages.count) recent messages within depth \(memoryDepth)")
-            
-            let recentHistory = formatMessagesAsHistory(recentMessages)
-            
-            // Build final prompt with unified context + summary + recent history
-            var prompt = systemPrompt
-            
-            if !unifiedContextText.isEmpty {
-                prompt += "\n\n\(unifiedContextText)"
-            }
-            
+        // STEP 4: Simple concatenation of 5 parts
+        var prompt = systemPrompt
+        
+        if !longTermSearchText.isEmpty {
+            prompt += "\n\n\(longTermSearchText)"
+        }
+        
+        if !shortTermText.isEmpty {
+            prompt += "\n\n\(shortTermText)"
+        }
+        
+        if !injectedSummary.isEmpty {
             prompt += "\n\nSummary of earlier conversation:\n\(injectedSummary)"
-            
-            if !recentHistory.isEmpty {
-                prompt += "\n\n\(recentHistory)"
-            }
-            
-            prompt += "\n\nUser: \(currentInput)\nAssistant:"
-            
-            print("HALDEBUG-MEMORY: Built prompt with summary mode - \(prompt.count) total characters")
-            return prompt
-            
+        }
+        
+        prompt += "\n\nUser: \(currentInput)\nAssistant:"
+        
+        print("HALDEBUG-MEMORY: Built prompt - \(prompt.count) total characters")
+        return prompt
+    }
+    
+    // FIXED: Calculate which turns should be in short-term memory
+    private func getShortTermTurns(currentTurns: Int) -> [Int] {
+        if lastSummarizedTurnCount == 0 {
+            // No summarization yet - include recent turns up to memory depth
+            let startTurn = max(1, currentTurns - memoryDepth + 1)
+            guard startTurn <= currentTurns else { return [] }
+            return Array(startTurn...currentTurns)
         } else {
-            print("HALDEBUG-MEMORY: Using full history mode")
+            // Summarization occurred - include turns since last summary up to memory depth
+            let turnsSinceLastSummary = currentTurns - lastSummarizedTurnCount
+            let turnsToInclude = min(turnsSinceLastSummary, memoryDepth)
             
-            // Use only the most recent messages within memory depth
-            let recentMessages = getRecentMessagesWithinDepth(allMessages, depth: memoryDepth)
-            print("HALDEBUG-MEMORY: Using \(recentMessages.count) recent messages within depth \(memoryDepth)")
+            guard turnsToInclude > 0 else { return [] }
             
-            let recentHistory = formatMessagesAsHistory(recentMessages)
-            
-            // Build final prompt with unified context + recent history
-            var prompt = systemPrompt
-            
-            if !unifiedContextText.isEmpty {
-                prompt += "\n\n\(unifiedContextText)"
-            }
-            
-            if !recentHistory.isEmpty {
-                prompt += "\n\n\(recentHistory)"
-            }
-            
-            prompt += "\n\nUser: \(currentInput)\nAssistant:"
-            
-            print("HALDEBUG-MEMORY: Built prompt with full history mode - \(prompt.count) total characters")
-            return prompt
+            let startTurn = currentTurns - turnsToInclude + 1
+            guard startTurn <= currentTurns else { return [] }
+            return Array(startTurn...currentTurns)
         }
     }
     
-    // Get recent messages within memory depth (in turn pairs)
-    private func getRecentMessagesWithinDepth(_ allMessages: [ChatMessage], depth: Int) -> [ChatMessage] {
-        let nonPartialMessages = allMessages.filter { !$0.isPartial }
-        let completedTurns = nonPartialMessages.filter { $0.isFromUser }.count
+    // FIXED: Get short-term messages for specific turns
+    private func getShortTermMessages(turns: [Int]) -> [ChatMessage] {
+        guard !turns.isEmpty else { return [] }
         
-        if completedTurns <= depth {
-            // If we have fewer turns than depth, return all messages
-            print("HALDEBUG-MEMORY: Returning all \(nonPartialMessages.count) messages (only \(completedTurns) turns)")
-            return nonPartialMessages
-        }
-        
-        // Get the last 'depth' turns worth of messages
+        let allMessages = messages.sorted(by: { $0.timestamp < $1.timestamp }).filter { !$0.isPartial }
         var result: [ChatMessage] = []
-        var turnsFound = 0
+        var currentTurn = 0
+        var currentTurnMessages: [ChatMessage] = []
         
-        // Work backwards through messages
-        for message in nonPartialMessages.reversed() {
-            result.insert(message, at: 0) // Insert at beginning to maintain order
-            
+        for message in allMessages {
             if message.isFromUser {
-                turnsFound += 1
-                if turnsFound >= depth {
-                    break
+                // Complete previous turn if it should be included
+                if !currentTurnMessages.isEmpty && turns.contains(currentTurn) {
+                    result.append(contentsOf: currentTurnMessages)
                 }
+                
+                // Start new turn
+                currentTurn += 1
+                currentTurnMessages = [message]
+            } else {
+                // Assistant message - add to current turn
+                currentTurnMessages.append(message)
+                
+                // Complete turn if it should be included
+                if turns.contains(currentTurn) {
+                    result.append(contentsOf: currentTurnMessages)
+                }
+                currentTurnMessages = []
             }
         }
         
-        print("HALDEBUG-MEMORY: Selected \(result.count) messages from last \(depth) turns")
         return result
     }
     
@@ -1380,14 +1247,8 @@ Summary:
                 throw NSError(domain: "FoundationModels", code: 1, userInfo: [NSLocalizedDescriptionKey: "Language model is not available on this device"])
             }
             
-            // Build prompt using unified search and memory depth
+            // Build prompt using simplified logic
             let promptWithMemory = buildPromptHistory(currentInput: content)
-            
-            // Clear pending auto-inject flag since we're using the summary now
-            if pendingAutoInject {
-                pendingAutoInject = false
-                print("HALDEBUG-MEMORY: Cleared pending auto-inject flag")
-            }
             
             let prompt = Prompt(promptWithMemory)
             let session = LanguageModelSession()
@@ -1411,8 +1272,16 @@ Summary:
             
             print("HALDEBUG-DATABASE: Updated AI response in array (\(response.count) characters)")
             
-            // Store completed turn in unified memory with proper turn counting
+            // Clear pending auto-inject flag AFTER successful LLM response
+            if pendingAutoInject {
+                pendingAutoInject = false
+                print("HALDEBUG-MEMORY: Cleared pending auto-inject flag after successful response")
+            }
+            
+            // Store completed turn in unified memory
             let currentTurnNumber = countCompletedTurns()
+            print("HALDEBUG-MEMORY: About to store turn \(currentTurnNumber) in database")
+            
             memoryStore.storeTurn(
                 conversationId: conversationId,
                 userMessage: content,
@@ -1420,6 +1289,16 @@ Summary:
                 systemPrompt: systemPrompt,
                 turnNumber: currentTurnNumber
             )
+            
+            // Immediate verification of storage success
+            let verification = memoryStore.getConversationMessages(conversationId: conversationId)
+            print("HALDEBUG-MEMORY: VERIFY - After storing turn \(currentTurnNumber), database has \(verification.count) messages")
+            let expectedMessages = currentTurnNumber * 2
+            if verification.count >= expectedMessages {
+                print("HALDEBUG-MEMORY: VERIFY - Turn \(currentTurnNumber) storage SUCCESS (expected \(expectedMessages), got \(verification.count))")
+            } else {
+                print("HALDEBUG-MEMORY: VERIFY - Turn \(currentTurnNumber) storage FAILED - expected \(expectedMessages) messages, got \(verification.count)")
+            }
             
             updateHistoricalStats()
             
@@ -1465,7 +1344,6 @@ Summary:
         currentUnifiedContext = UnifiedSearchContext(
             conversationSnippets: [],
             documentSnippets: [],
-            entityMatches: [],
             relevanceScores: [],
             totalTokens: 0
         )
@@ -1474,8 +1352,7 @@ Summary:
     }
 }
 
-// ========== BLOCK 4: ARRAY-BASED CHATVIEWMODEL WITH PERSISTENCE - END ==========
-
+// ========== BLOCK 4: ARRAY-BASED CHATVIEWMODEL WITH CORRECT MEMORY LOGIC - END ==========
 
 
 // ========== BLOCK 5: CHAT BUBBLE VIEW WITH LOGGING - START ==========
@@ -2124,10 +2001,10 @@ extension ChatView {
                     Text("Entities:")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("\(viewModel.currentUnifiedContext.entityMatches.count)")
+                    Text("0")
                         .font(.caption)
                         .bold()
-                        .foregroundColor(viewModel.currentUnifiedContext.entityMatches.count > 0 ? .primary : .secondary)
+                        .foregroundColor(.secondary)
                 }
                 
                 Spacer()
@@ -2815,64 +2692,22 @@ private func showErrorAlert(_ message: String) {
 // ========== BLOCK 8: APP ENTRY POINT WITH DOCUMENT IMPORT MENU - END ==========
 
 
-// ========== BLOCK 9: CONVERSATION STORAGE AND UNIFIED SEARCH SYSTEM - START ==========
+// ========== BLOCK 9: CONVERSATION STORAGE AND FIXED SEARCH SYSTEM - START ==========
 
-// MARK: - Conversation Storage and Unified Search System
+// MARK: - Conversation Storage and Fixed Search System
 extension MemoryStore {
     
-    // COMMENTED OUT: Extract entities from text using Apple's NaturalLanguage
-    // Reason: Simplified embedding system doesn't use entity enhancement
-    // Can be restored when entity features are re-enabled
-    /*
-    func extractEntities(from text: String) -> [NamedEntity] {
-        print("HALDEBUG-ENTITY: Extracting entities from text length \(text.count)")
-        
-        var entities: [NamedEntity] = []
-        let tagger = NLTagger(tagSchemes: [.nameType])
-        tagger.string = text
-        
-        let options: NLTagger.Options = [.omitWhitespace, .omitPunctuation, .joinNames]
-        
-        tagger.enumerateTags(in: text.startIndex..<text.endIndex, unit: .word, scheme: .nameType, options: options) { tag, tokenRange in
-            guard let tag = tag else { return true }
-            
-            let tokenText = String(text[tokenRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !tokenText.isEmpty else { return true }
-            
-            let entityType: NamedEntity.EntityType
-            switch tag {
-            case .personalName:
-                entityType = .person
-            case .placeName:
-                entityType = .place
-            case .organizationName:
-                entityType = .organization
-            default:
-                entityType = .other
-            }
-            
-            let nsRange = NSRange(tokenRange, in: text)
-            let entity = NamedEntity(text: tokenText, type: entityType, range: nsRange)
-            entities.append(entity)
-            
-            return true
-        }
-        
-        print("HALDEBUG-ENTITY: Extracted \(entities.count) entities")
-        return entities
-    }
-    */
-    
-    // Store conversation turn in unified memory (SIMPLIFIED - no entities)
+    // Store conversation turn in unified memory with correct string binding
     func storeTurn(conversationId: String, userMessage: String, assistantMessage: String, systemPrompt: String, turnNumber: Int) {
         print("HALDEBUG-MEMORY: Storing turn \(turnNumber) for conversation \(conversationId)")
+        print("HALDEBUG-MEMORY: SURGERY - StoreTurn start convId='\(conversationId.prefix(8))...' turn=\(turnNumber)")
         
         guard ensureHealthyConnection() else {
             print("HALDEBUG-MEMORY: Cannot store turn - no database connection")
             return
         }
         
-        // Store user message (SIMPLIFIED - no entity extraction)
+        // Store user message with correct string binding
         let userContentId = storeUnifiedContent(
             content: userMessage,
             sourceType: .conversation,
@@ -2881,7 +2716,7 @@ extension MemoryStore {
             timestamp: Date()
         )
         
-        // Store assistant message (SIMPLIFIED - no entity extraction)
+        // Store assistant message with correct string binding
         let assistantContentId = storeUnifiedContent(
             content: assistantMessage,
             sourceType: .conversation,
@@ -2891,12 +2726,13 @@ extension MemoryStore {
         )
         
         print("HALDEBUG-MEMORY: Stored turn \(turnNumber) - user: \(userContentId), assistant: \(assistantContentId)")
+        print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete user='\(userContentId.prefix(8))...' assistant='\(assistantContentId.prefix(8))...'")
         
         // Update conversation statistics
         loadUnifiedStats()
     }
     
-    // Store unified content with embeddings (SIMPLIFIED - no entities)
+    // Store unified content with CORRECT string binding using NSString.utf8String
     func storeUnifiedContent(content: String, sourceType: ContentSourceType, sourceId: String, position: Int, timestamp: Date) -> String {
         print("HALDEBUG-MEMORY: Storing unified content - type: \(sourceType), position: \(position)")
         
@@ -2906,14 +2742,18 @@ extension MemoryStore {
         }
         
         let contentId = UUID().uuidString
-        let embedding = generateEmbedding(for: content) // SIMPLIFIED - no entities parameter
+        let embedding = generateEmbedding(for: content)
         let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
             Data(buffer: buffer)
         }
         
+        // SURGICAL DEBUG: Log exact values being stored
+        print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))...' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...' pos=\(position)")
+        
+        // Updated SQL with all 10 columns to match Block 1 schema
         let sql = """
         INSERT OR REPLACE INTO unified_content 
-        (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, entity_count, metadata_json) 
+        (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, metadata_json, created_at) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         
@@ -2926,49 +2766,85 @@ extension MemoryStore {
         
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             print("HALDEBUG-MEMORY: Failed to prepare content insert")
+            print("HALDEBUG-MEMORY: SURGERY - Store FAILED at prepare step")
             return ""
         }
         
         let isFromUser = (sourceType == .conversation && position % 2 == 1) ? 1 : 0
+        let createdAt = Int64(Date().timeIntervalSince1970)
         
-        _ = contentId.withCString { sqlite3_bind_text(stmt, 1, $0, -1, nil) }
-        _ = content.withCString { sqlite3_bind_text(stmt, 2, $0, -1, nil) }
+        // SURGICAL DEBUG: Log exact parameter binding with string verification
+        print("HALDEBUG-MEMORY: SURGERY - Store binding isFromUser=\(isFromUser) createdAt=\(createdAt)")
+        print("HALDEBUG-MEMORY: SURGERY - Store strings sourceType='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...'")
+        
+        // CORRECT: Bind all 10 parameters using NSString.utf8String for strings
+        
+        // Parameter 1: contentId (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 1, (contentId as NSString).utf8String, -1, nil)
+        
+        // Parameter 2: content (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 2, (content as NSString).utf8String, -1, nil)
+        
+        // Parameter 3: embedding (BLOB)
         _ = embeddingBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32(embeddingBlob.count), nil) }
+        
+        // Parameter 4: timestamp (INTEGER)
         sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
-        _ = sourceType.rawValue.withCString { sqlite3_bind_text(stmt, 5, $0, -1, nil) }
-        _ = sourceId.withCString { sqlite3_bind_text(stmt, 6, $0, -1, nil) }
+        
+        // Parameter 5: source_type (STRING) - CORRECT BINDING WITH SURGICAL DEBUG
+        print("HALDEBUG-MEMORY: SURGERY - About to bind sourceType='\(sourceType.rawValue)' to parameter 5 using NSString.utf8String")
+        sqlite3_bind_text(stmt, 5, (sourceType.rawValue as NSString).utf8String, -1, nil)
+        
+        // Parameter 6: source_id (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 6, (sourceId as NSString).utf8String, -1, nil)
+        
+        // Parameter 7: position (INTEGER)
         sqlite3_bind_int(stmt, 7, Int32(position))
+        
+        // Parameter 8: is_from_user (INTEGER)
         sqlite3_bind_int(stmt, 8, Int32(isFromUser))
-        sqlite3_bind_int(stmt, 9, 0) // SIMPLIFIED - no entities, so count is 0
-        _ = "{}".withCString { sqlite3_bind_text(stmt, 10, $0, -1, nil) } // Empty metadata
+        
+        // Parameter 9: metadata_json (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 9, ("{}" as NSString).utf8String, -1, nil)
+        
+        // Parameter 10: created_at (INTEGER)
+        sqlite3_bind_int64(stmt, 10, createdAt)
         
         if sqlite3_step(stmt) == SQLITE_DONE {
             print("HALDEBUG-MEMORY: Stored content successfully - ID: \(contentId)")
+            print("HALDEBUG-MEMORY: SURGERY - Store SUCCESS id='\(contentId.prefix(8))...' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...'")
             return contentId
         } else {
             let errorMessage = String(cString: sqlite3_errmsg(db))
             print("HALDEBUG-MEMORY: Failed to store content: \(errorMessage)")
+            print("HALDEBUG-MEMORY: SURGERY - Store FAILED error='\(errorMessage)'")
             return ""
         }
     }
     
-    // Retrieve conversation messages for display
+    // Retrieve conversation messages with surgical debug
     func getConversationMessages(conversationId: String) -> [ChatMessage] {
         print("HALDEBUG-MEMORY: Loading messages for conversation: \(conversationId)")
+        print("HALDEBUG-MEMORY: SURGERY - Retrieve start convId='\(conversationId.prefix(8))...'")
         
         guard ensureHealthyConnection() else {
             print("HALDEBUG-MEMORY: Cannot load messages - no database connection")
+            print("HALDEBUG-MEMORY: SURGERY - Retrieve FAILED no connection")
             return []
         }
         
         var messages: [ChatMessage] = []
         
+        // These column names match Block 1 schema exactly
         let sql = """
         SELECT content, is_from_user, timestamp, position 
         FROM unified_content 
         WHERE source_type = 'conversation' AND source_id = ? 
         ORDER BY position ASC;
         """
+        
+        // SURGICAL DEBUG: Log exact query being executed
+        print("HALDEBUG-MEMORY: SURGERY - Retrieve query sourceType='conversation' sourceId='\(conversationId.prefix(8))...'")
         
         var stmt: OpaquePointer?
         defer {
@@ -2979,18 +2855,29 @@ extension MemoryStore {
         
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             print("HALDEBUG-MEMORY: Failed to prepare message query")
+            print("HALDEBUG-MEMORY: SURGERY - Retrieve FAILED prepare")
             return []
         }
         
-        _ = conversationId.withCString { sqlite3_bind_text(stmt, 1, $0, -1, nil) }
+        // CORRECT: Bind conversationId using NSString.utf8String
+        sqlite3_bind_text(stmt, 1, (conversationId as NSString).utf8String, -1, nil)
         
+        var rowCount = 0
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let contentCString = sqlite3_column_text(stmt, 0) else { continue }
             
             let content = String(cString: contentCString)
             let isFromUser = sqlite3_column_int(stmt, 1) == 1
             let timestampValue = sqlite3_column_int64(stmt, 2)
+            let position = sqlite3_column_int(stmt, 3)
             let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
+            
+            rowCount += 1
+            
+            // SURGICAL DEBUG: Log first found row
+            if rowCount == 1 {
+                print("HALDEBUG-MEMORY: SURGERY - Retrieve found row content='\(content.prefix(20))...' isFromUser=\(isFromUser) pos=\(position)")
+            }
             
             let message = ChatMessage(
                 content: content,
@@ -3002,24 +2889,25 @@ extension MemoryStore {
         }
         
         print("HALDEBUG-MEMORY: Loaded \(messages.count) messages for conversation \(conversationId)")
+        print("HALDEBUG-MEMORY: SURGERY - Retrieve complete found=\(messages.count) rows convId='\(conversationId.prefix(8))...'")
         return messages
     }
     
-    // Search unified content across conversations and documents (SIMPLIFIED - no entity matching)
-    func searchUnifiedContent(for query: String, currentConversationId: String, excludingRecentTurns: Int, maxResults: Int) -> UnifiedSearchContext {
-        print("HALDEBUG-SEARCH: Searching unified content for: '\(query)'")
+    // FIXED: Search unified content excluding specific turns from current conversation
+    func searchUnifiedContent(for query: String, currentConversationId: String, excludeTurns: [Int], maxResults: Int) -> UnifiedSearchContext {
+        print("HALDEBUG-SEARCH: FIXED - Searching unified content for: '\(query)' excluding turns: \(excludeTurns)")
         
         guard ensureHealthyConnection() else {
             print("HALDEBUG-SEARCH: Cannot search - no database connection")
-            return UnifiedSearchContext(conversationSnippets: [], documentSnippets: [], entityMatches: [], relevanceScores: [], totalTokens: 0)
+            return UnifiedSearchContext(conversationSnippets: [], documentSnippets: [], relevanceScores: [], totalTokens: 0)
         }
         
-        let queryEmbedding = generateEmbedding(for: query) // SIMPLIFIED - no entities
+        let queryEmbedding = generateEmbedding(for: query)
         var conversationSnippets: [String] = []
         var documentSnippets: [String] = []
         var relevanceScores: [Double] = []
         
-        // Search documents
+        // Search documents (unchanged - always include all documents)
         let documentSQL = """
         SELECT content, embedding 
         FROM unified_content 
@@ -3061,15 +2949,38 @@ extension MemoryStore {
             }
         }
         
-        // Search conversations (excluding current)
-        let conversationSQL = """
-        SELECT content, embedding 
+        // FIXED: Search conversations with correct exclusion logic
+        print("HALDEBUG-SEARCH: FIXED - Building conversation search with exclusions")
+        
+        // Convert excludeTurns to position ranges to exclude
+        var excludePositions: [Int] = []
+        for turn in excludeTurns {
+            excludePositions.append(turn * 2 - 1) // User message position
+            excludePositions.append(turn * 2)     // Assistant message position
+        }
+        
+        print("HALDEBUG-SEARCH: FIXED - Excluding positions: \(excludePositions) for turns: \(excludeTurns)")
+        
+        // Build dynamic SQL based on exclusions
+        var conversationSQL = """
+        SELECT content, embedding, position, source_id
         FROM unified_content 
-        WHERE source_type = 'conversation' 
-        AND source_id != ? 
-        ORDER BY timestamp DESC 
-        LIMIT 50;
+        WHERE source_type = 'conversation'
         """
+        
+        // Add exclusion logic for current conversation
+        if !excludePositions.isEmpty {
+            conversationSQL += " AND (source_id != ? OR position NOT IN ("
+            conversationSQL += excludePositions.map { _ in "?" }.joined(separator: ", ")
+            conversationSQL += "))"
+        }
+        
+        conversationSQL += """
+         ORDER BY timestamp DESC 
+         LIMIT 50;
+        """
+        
+        print("HALDEBUG-SEARCH: FIXED - Dynamic SQL: \(conversationSQL)")
         
         var conversationStmt: OpaquePointer?
         defer {
@@ -3079,13 +2990,30 @@ extension MemoryStore {
         }
         
         if sqlite3_prepare_v2(db, conversationSQL, -1, &conversationStmt, nil) == SQLITE_OK {
-            _ = currentConversationId.withCString { sqlite3_bind_text(conversationStmt, 1, $0, -1, nil) }
+            var paramIndex = 1
+            
+            // Bind current conversation ID if we have exclusions
+            if !excludePositions.isEmpty {
+                sqlite3_bind_text(conversationStmt, Int32(paramIndex), (currentConversationId as NSString).utf8String, -1, nil)
+                paramIndex += 1
+                
+                // Bind each excluded position
+                for position in excludePositions {
+                    sqlite3_bind_int(conversationStmt, Int32(paramIndex), Int32(position))
+                    paramIndex += 1
+                }
+            }
+            
+            print("HALDEBUG-SEARCH: FIXED - Bound \(paramIndex - 1) parameters for exclusion query")
             
             while sqlite3_step(conversationStmt) == SQLITE_ROW {
                 guard let contentCString = sqlite3_column_text(conversationStmt, 0),
-                      let embeddingBlob = sqlite3_column_blob(conversationStmt, 1) else { continue }
+                      let embeddingBlob = sqlite3_column_blob(conversationStmt, 1),
+                      let sourceIdCString = sqlite3_column_text(conversationStmt, 3) else { continue }
                 
                 let content = String(cString: contentCString)
+                let position = sqlite3_column_int(conversationStmt, 2)
+                let sourceId = String(cString: sourceIdCString)
                 let embeddingSize = sqlite3_column_bytes(conversationStmt, 1)
                 let embeddingData = Data(bytes: embeddingBlob, count: Int(embeddingSize))
                 
@@ -3099,57 +3027,91 @@ extension MemoryStore {
                     conversationSnippets.append(content)
                     relevanceScores.append(similarity)
                     
+                    let isCurrentConv = sourceId == currentConversationId
+                    let turnNumber = (Int(position) + 1) / 2
+                    print("HALDEBUG-SEARCH: FIXED - Found relevant content: '\(content.prefix(30))...' similarity=\(String(format: "%.3f", similarity)) pos=\(position) turn=\(turnNumber) currentConv=\(isCurrentConv)")
+                    
                     if conversationSnippets.count >= maxResults / 2 {
                         break
                     }
                 }
             }
+        } else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            print("HALDEBUG-SEARCH: FIXED - Failed to prepare conversation search: \(errorMessage)")
         }
-        
-        // SIMPLIFIED: No entity search for now
-        let entityMatches: [String] = []
-        
-        /*
-        // COMMENTED OUT: Entity search functionality
-        // Search for entity matches
-        let entitySQL = """
-        SELECT DISTINCT entity_text
-        FROM unified_entities
-        WHERE LOWER(entity_text) LIKE ?
-        LIMIT 10;
-        """
-        
-        var entityStmt: OpaquePointer?
-        defer {
-            if entityStmt != nil {
-                sqlite3_finalize(entityStmt)
-            }
-        }
-        
-        if sqlite3_prepare_v2(db, entitySQL, -1, &entityStmt, nil) == SQLITE_OK {
-            let searchPattern = "%\(query.lowercased())%"
-            _ = searchPattern.withCString { sqlite3_bind_text(entityStmt, 1, $0, -1, nil) }
-            
-            while sqlite3_step(entityStmt) == SQLITE_ROW {
-                if let entityCString = sqlite3_column_text(entityStmt, 0) {
-                    let entity = String(cString: entityCString)
-                    entityMatches.append(entity)
-                }
-            }
-        }
-        */
         
         let totalTokens = (conversationSnippets + documentSnippets).map { $0.split(separator: " ").count }.reduce(0, +)
         
-        print("HALDEBUG-SEARCH: Found \(conversationSnippets.count) conversation + \(documentSnippets.count) document snippets")
+        print("HALDEBUG-SEARCH: FIXED - Found \(conversationSnippets.count) conversation + \(documentSnippets.count) document snippets excluding turns \(excludeTurns)")
         
         return UnifiedSearchContext(
             conversationSnippets: conversationSnippets,
             documentSnippets: documentSnippets,
-            entityMatches: entityMatches,
             relevanceScores: relevanceScores,
             totalTokens: totalTokens
         )
+    }
+}
+
+// MARK: - Enhanced Debug Database Function with Surgical Output
+extension MemoryStore {
+    
+    // SURGICAL DEBUG: Enhanced database inspection for debugging storage/retrieval mismatch
+    func debugDatabaseWithSurgicalPrecision() {
+        print("HALDEBUG-DATABASE: SURGERY - Debug DB inspection starting")
+        
+        guard ensureHealthyConnection() else {
+            print("HALDEBUG-DATABASE: SURGERY - Debug FAILED no connection")
+            return
+        }
+        
+        // Check table existence and structure
+        var stmt: OpaquePointer?
+        
+        // 1. Count total rows in unified_content
+        let countSQL = "SELECT COUNT(*) FROM unified_content;"
+        if sqlite3_prepare_v2(db, countSQL, -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                let totalRows = sqlite3_column_int(stmt, 0)
+                print("HALDEBUG-DATABASE: SURGERY - Table unified_content has \(totalRows) total rows")
+            }
+        }
+        sqlite3_finalize(stmt)
+        
+        // 2. Show conversation-type rows specifically
+        let convSQL = "SELECT source_id, source_type, position, content FROM unified_content WHERE source_type = 'conversation' LIMIT 3;"
+        if sqlite3_prepare_v2(db, convSQL, -1, &stmt, nil) == SQLITE_OK {
+            var convRowCount = 0
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                convRowCount += 1
+                
+                let sourceId = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "NULL"
+                let sourceType = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "NULL"
+                let position = sqlite3_column_int(stmt, 2)
+                let content = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "NULL"
+                
+                print("HALDEBUG-DATABASE: SURGERY - Conv row \(convRowCount): sourceId='\(sourceId.prefix(8))...' type='\(sourceType)' pos=\(position) content='\(content.prefix(20))...'")
+            }
+            if convRowCount == 0 {
+                print("HALDEBUG-DATABASE: SURGERY - No conversation rows found in table")
+            }
+        }
+        sqlite3_finalize(stmt)
+        
+        // 3. Show all distinct source_types
+        let typesSQL = "SELECT DISTINCT source_type, COUNT(*) FROM unified_content GROUP BY source_type;"
+        if sqlite3_prepare_v2(db, typesSQL, -1, &stmt, nil) == SQLITE_OK {
+            print("HALDEBUG-DATABASE: SURGERY - Source types in table:")
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let sourceType = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "NULL"
+                let count = sqlite3_column_int(stmt, 1)
+                print("HALDEBUG-DATABASE: SURGERY -   type='\(sourceType)' count=\(count)")
+            }
+        }
+        sqlite3_finalize(stmt)
+        
+        print("HALDEBUG-DATABASE: SURGERY - Debug DB inspection complete")
     }
 }
 
@@ -3158,8 +3120,7 @@ extension Notification.Name {
     static let showDocumentImport = Notification.Name("showDocumentImport")
 }
 
-// ========== BLOCK 9: CONVERSATION STORAGE AND UNIFIED SEARCH SYSTEM - END ==========
-
+// ========== BLOCK 9: CONVERSATION STORAGE AND FIXED SEARCH SYSTEM - END ==========
 
 
 // ========== BLOCK 10: DOCUMENT IMPORT MANAGER IMPLEMENTATION - START ==========
