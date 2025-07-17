@@ -1,4 +1,11 @@
 // ========== BLOCK 1: MEMORY MODELS AND DATABASE SETUP - START ==========
+//
+//  ContentView.swift
+//  Mentat
+//
+//  Created by Mark Friedlander on 6/9/25.
+//
+
 import SwiftUI
 import Foundation
 import Combine
@@ -8,6 +15,28 @@ import UniformTypeIdentifiers
 import SQLite3
 import NaturalLanguage
 import PDFKit
+
+// MARK: - Named Entity Support
+struct NamedEntity: Codable, Hashable {
+    let text: String        // e.g., "Mark Friedlander"
+    let type: EntityType    // e.g., .person
+    
+    enum EntityType: String, Codable, CaseIterable {
+        case person = "person"           // People: "Mark Friedlander", "Elon Musk"
+        case place = "place"             // Locations: "New York", "Paris"
+        case organization = "org"        // Companies: "Apple", "Google"
+        case other = "other"             // Other recognized entities by NL framework (we will filter these out for storage)
+        
+        var displayName: String {
+            switch self {
+            case .person: return "Person"
+            case .place: return "Place"
+            case .organization: return "Organization"
+            case .other: return "Other"
+            }
+        }
+    }
+}
 
 // MARK: - Cross-Session SQLite Memory Models
 struct StoredConversation {
@@ -64,11 +93,21 @@ enum ContentSourceType: String, CaseIterable, Codable {
     }
 }
 
+// MARK: - Enhanced Search Context with Entity Support
+struct UnifiedSearchResult: Identifiable, Hashable {
+    let id = UUID()
+    let content: String
+    var relevance: Double  // FIXED: Changed from 'let' to 'var' to allow Block 9 fusion logic to boost scores
+    let source: String
+    var isEntityMatch: Bool // NEW PROPERTY to track if snippet was found via entity search
+}
+
 // MARK: - Memory Store with Persistent Database Connection
 class MemoryStore: ObservableObject {
     static let shared = MemoryStore()
     
     @Published var isEnabled: Bool = true
+    @AppStorage("relevanceThreshold") var relevanceThreshold: Double = 0.65
     @Published var currentHistoricalContext: HistoricalContext = HistoricalContext(
         conversationCount: 0,
         relevantConversations: 0,
@@ -85,7 +124,6 @@ class MemoryStore: ObservableObject {
     // Persistent database connection - no more open/close every operation
     private var db: OpaquePointer?
     private var isConnected: Bool = false
-    private let relevanceThreshold: Double = 0.65
     
     private init() {
         print("HALDEBUG-DATABASE: MemoryStore initializing with persistent connection...")
@@ -154,6 +192,7 @@ class MemoryStore: ObservableObject {
             } catch {
                 failedCount += 1
                 print("HALDEBUG-DATABASE: ❌ Failed to delete \(fileURL.lastPathComponent): \(error.localizedDescription)")
+                // Continue anyway - partial cleanup is better than none
             }
         }
         
@@ -245,14 +284,14 @@ class MemoryStore: ObservableObject {
         return isConnected
     }
     
-    // Create simplified unified schema - MATCHES Block 9 exactly
+    // Create simplified unified schema with entity support - MATCHES Block 9 exactly
     private func createUnifiedSchema() {
         guard ensureHealthyConnection() else {
             print("HALDEBUG-DATABASE: ❌ Cannot create schema - no database connection")
             return
         }
         
-        print("HALDEBUG-DATABASE: Creating simplified unified database schema...")
+        print("HALDEBUG-DATABASE: Creating unified database schema with entity support...")
         
         // Create sources table first (no dependencies)
         let sourcesSQL = """
@@ -271,7 +310,7 @@ class MemoryStore: ObservableObject {
         );
         """
         
-        // SCHEMA ALIGNED TO BLOCK 9: This exactly matches what Block 9 expects
+        // ENHANCED SCHEMA: Add entity_keywords column for entity-based search
         let unifiedContentSQL = """
         CREATE TABLE IF NOT EXISTS unified_content (
             id TEXT PRIMARY KEY,
@@ -282,6 +321,7 @@ class MemoryStore: ObservableObject {
             source_id TEXT NOT NULL,
             position INTEGER NOT NULL,
             is_from_user INTEGER,
+            entity_keywords TEXT,
             metadata_json TEXT,
             created_at INTEGER DEFAULT (strftime('%s', 'now')),
             UNIQUE(source_type, source_id, position)
@@ -296,30 +336,31 @@ class MemoryStore: ObservableObject {
         
         for (tableName, sql) in tables {
             if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
-                print("HALDEBUG-DATABASE: ✅ Created \(tableName) table")
+                print("HALDEBUG-DATABASE: ✅ Created \(tableName) table with entity support")
             } else {
                 let errorMessage = String(cString: sqlite3_errmsg(db))
                 print("HALDEBUG-DATABASE: ❌ Failed to create \(tableName) table: \(errorMessage)")
             }
         }
         
-        // Create simplified performance indexes
+        // Create enhanced performance indexes including entity_keywords
         let unifiedIndexes = [
             "CREATE INDEX IF NOT EXISTS idx_unified_content_source ON unified_content(source_type, source_id);",
             "CREATE INDEX IF NOT EXISTS idx_unified_content_timestamp ON unified_content(timestamp);",
             "CREATE INDEX IF NOT EXISTS idx_unified_content_from_user ON unified_content(is_from_user);",
+            "CREATE INDEX IF NOT EXISTS idx_unified_content_entities ON unified_content(entity_keywords);",
             "CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(source_type);"
         ]
         
         for indexSQL in unifiedIndexes {
             if sqlite3_exec(db, indexSQL, nil, nil, nil) == SQLITE_OK {
-                print("HALDEBUG-DATABASE: ✅ Created index")
+                print("HALDEBUG-DATABASE: ✅ Created index with entity support")
             } else {
                 print("HALDEBUG-DATABASE: ⚠️ Failed to create index: \(indexSQL)")
             }
         }
         
-        print("HALDEBUG-DATABASE: ✅ Simplified unified schema creation complete")
+        print("HALDEBUG-DATABASE: ✅ Unified schema creation complete with entity support")
     }
     
     // ENCRYPTION: Enable Apple Data Protection on database file
@@ -447,18 +488,238 @@ class MemoryStore: ObservableObject {
         return (connected: isConnected, path: dbPath, tables: tables)
     }
 }
+
+// MARK: - Enhanced Conversation Storage with Entity Extraction
+extension MemoryStore {
+    
+    // Store conversation turn in unified memory with entity extraction
+    func storeTurn(conversationId: String, userMessage: String, assistantMessage: String, systemPrompt: String, turnNumber: Int) {
+        print("HALDEBUG-MEMORY: Storing turn \(turnNumber) for conversation \(conversationId) with entity extraction")
+        print("HALDEBUG-MEMORY: SURGERY - StoreTurn start convId='\(conversationId.prefix(8))...' turn=\(turnNumber)")
+        
+        guard ensureHealthyConnection() else {
+            print("HALDEBUG-MEMORY: Cannot store turn - no database connection")
+            return
+        }
+        
+        // ENHANCED: Extract entities from both user and assistant messages
+        let userEntities = extractNamedEntitiesWithFallback(from: userMessage)
+        let assistantEntities = extractNamedEntitiesWithFallback(from: assistantMessage)
+        let combinedEntitiesKeywords = (userEntities + assistantEntities).map { $0.text.lowercased() }.joined(separator: " ")
+        
+        print("HALDEBUG-MEMORY: Extracted \(userEntities.count) user entities, \(assistantEntities.count) assistant entities")
+        print("HALDEBUG-MEMORY: Combined entity keywords: '\(combinedEntitiesKeywords)'")
+        
+        // Store user message with entity keywords
+        let userContentId = storeUnifiedContentWithEntities(
+            content: userMessage,
+            sourceType: .conversation,
+            sourceId: conversationId,
+            position: turnNumber * 2 - 1,
+            timestamp: Date(),
+            entityKeywords: combinedEntitiesKeywords
+        )
+        
+        // Store assistant message with entity keywords
+        let assistantContentId = storeUnifiedContentWithEntities(
+            content: assistantMessage,
+            sourceType: .conversation,
+            sourceId: conversationId,
+            position: turnNumber * 2,
+            timestamp: Date(),
+            entityKeywords: combinedEntitiesKeywords
+        )
+        
+        print("HALDEBUG-MEMORY: Stored turn \(turnNumber) - user: \(userContentId), assistant: \(assistantContentId)")
+        print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete user='\(userContentId.prefix(8))...' assistant='\(assistantContentId.prefix(8))...'")
+        
+        // Update conversation statistics
+        loadUnifiedStats()
+    }
+    
+    // ENHANCED: Store unified content with entity keywords support
+    func storeUnifiedContentWithEntities(content: String, sourceType: ContentSourceType, sourceId: String, position: Int, timestamp: Date, entityKeywords: String = "") -> String {
+        print("HALDEBUG-MEMORY: Storing unified content with entities - type: \(sourceType), position: \(position)")
+        
+        guard ensureHealthyConnection() else {
+            print("HALDEBUG-MEMORY: Cannot store content - no database connection")
+            return ""
+        }
+        
+        let contentId = UUID().uuidString
+        let embedding = generateEmbedding(for: content)
+        let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
+            Data(buffer: buffer)
+        }
+        
+        // SURGICAL DEBUG: Log exact values being stored
+        print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))...' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...' pos=\(position)")
+        print("HALDEBUG-MEMORY: Entity keywords being stored: '\(entityKeywords)'")
+        
+        // ENHANCED SQL with entity_keywords column
+        let sql = """
+        INSERT OR REPLACE INTO unified_content 
+        (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, entity_keywords, metadata_json, created_at) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        
+        var stmt: OpaquePointer?
+        defer {
+            if stmt != nil {
+                sqlite3_finalize(stmt)
+            }
+        }
+        
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("HALDEBUG-MEMORY: Failed to prepare enhanced content insert")
+            print("HALDEBUG-MEMORY: SURGERY - Store FAILED at prepare step")
+            return ""
+        }
+        
+        let isFromUser = (sourceType == .conversation && position % 2 == 1) ? 1 : 0
+        let createdAt = Int64(Date().timeIntervalSince1970)
+        
+        // SURGICAL DEBUG: Log exact parameter binding with string verification
+        print("HALDEBUG-MEMORY: SURGERY - Store binding isFromUser=\(isFromUser) createdAt=\(createdAt)")
+        print("HALDEBUG-MEMORY: SURGERY - Store strings sourceType='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...'")
+        
+        // ENHANCED: Bind all 11 parameters including entity_keywords
+        
+        // Parameter 1: contentId (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 1, (contentId as NSString).utf8String, -1, nil)
+        
+        // Parameter 2: content (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 2, (content as NSString).utf8String, -1, nil)
+        
+        // Parameter 3: embedding (BLOB)
+        _ = embeddingBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32(embeddingBlob.count), nil) }
+        
+        // Parameter 4: timestamp (INTEGER)
+        sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
+        
+        // Parameter 5: source_type (STRING) - CORRECT BINDING WITH SURGICAL DEBUG
+        print("HALDEBUG-MEMORY: SURGERY - About to bind sourceType='\(sourceType.rawValue)' to parameter 5 using NSString.utf8String")
+        sqlite3_bind_text(stmt, 5, (sourceType.rawValue as NSString).utf8String, -1, nil)
+        
+        // Parameter 6: source_id (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 6, (sourceId as NSString).utf8String, -1, nil)
+        
+        // Parameter 7: position (INTEGER)
+        sqlite3_bind_int(stmt, 7, Int32(position))
+        
+        // Parameter 8: is_from_user (INTEGER)
+        sqlite3_bind_int(stmt, 8, Int32(isFromUser))
+        
+        // Parameter 9: entity_keywords (STRING) - NEW ENHANCED BINDING
+        sqlite3_bind_text(stmt, 9, (entityKeywords as NSString).utf8String, -1, nil)
+        
+        // Parameter 10: metadata_json (STRING) - CORRECT BINDING
+        sqlite3_bind_text(stmt, 10, ("{}" as NSString).utf8String, -1, nil)
+        
+        // Parameter 11: created_at (INTEGER)
+        sqlite3_bind_int64(stmt, 11, createdAt)
+        
+        if sqlite3_step(stmt) == SQLITE_DONE {
+            print("HALDEBUG-MEMORY: Stored content successfully with entities - ID: \(contentId)")
+            print("HALDEBUG-MEMORY: SURGERY - Store SUCCESS id='\(contentId.prefix(8))...' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...'")
+            return contentId
+        } else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            print("HALDEBUG-MEMORY: Failed to store content with entities: \(errorMessage)")
+            print("HALDEBUG-MEMORY: SURGERY - Store FAILED error='\(errorMessage)'")
+            return ""
+        }
+    }
+    
+    // Note: Entity extraction functions implemented in Block 2
+}
+
+// MARK: - Enhanced Notification Extensions
+extension Notification.Name {
+    static let databaseUpdated = Notification.Name("databaseUpdated")
+    static let relevanceThresholdDidChange = Notification.Name("relevanceThresholdDidChange")
+    static let showDocumentImport = Notification.Name("showDocumentImport")  // FIXED: Added missing notification for Block 8
+}
 // ========== BLOCK 1: MEMORY MODELS AND DATABASE SETUP - END ==========
 
 
 
 // ========== BLOCK 2: SIMPLIFIED EMBEDDING SYSTEM (MENTAT-PROVEN APPROACH) - START ==========
 
+// MARK: - Enhanced Entity Extraction with NLTagger
+extension MemoryStore {
+    
+    // ENHANCED: Extract named entities using Apple's NaturalLanguage framework
+    func extractNamedEntities(from text: String) -> [NamedEntity] {
+        print("HALDEBUG-ENTITY: Extracting entities from text length: \(text.count)")
+        
+        // Graceful error handling - return empty array if text is empty
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else {
+            print("HALDEBUG-ENTITY: Empty text provided, returning empty entities")
+            return []
+        }
+        
+        // FIXED: Removed unnecessary do-catch since NLTagger methods don't throw
+        let tagger = NLTagger(tagSchemes: [.nameType])
+        tagger.string = cleanText
+        
+        var extractedEntities: [NamedEntity] = []
+        
+        // Process text to find named entities with error handling
+        tagger.enumerateTags(in: cleanText.startIndex..<cleanText.endIndex, unit: .word, scheme: .nameType, options: [.joinNames]) { tag, tokenRange in
+            // Graceful handling of tag processing
+            guard let tag = tag else {
+                return true // Continue enumeration even if tag is nil
+            }
+            
+            // Map NLTag to our EntityType
+            let entityType: NamedEntity.EntityType
+            switch tag {
+            case .personalName:
+                entityType = .person
+            case .placeName:
+                entityType = .place
+            case .organizationName:
+                entityType = .organization
+            default:
+                entityType = .other
+            }
+            
+            // Only add if it's a specific named entity type (Person, Place, Organization)
+            if entityType != .other {
+                let entityText = String(cleanText[tokenRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Additional validation - ensure entity text is not empty
+                if !entityText.isEmpty {
+                    extractedEntities.append(NamedEntity(text: entityText, type: entityType))
+                    print("HALDEBUG-ENTITY: Found \(entityType.displayName): '\(entityText)'")
+                }
+            }
+            
+            return true // Continue enumeration
+        }
+        
+        // Remove duplicates while preserving order
+        let uniqueEntities = Array(Set(extractedEntities))
+        
+        print("HALDEBUG-ENTITY: Extracted \(uniqueEntities.count) unique entities from \(extractedEntities.count) total")
+        return uniqueEntities
+    }
+    
+    // ENHANCED: Updated fallback function to use the real implementation
+    func extractNamedEntitiesWithFallback(from text: String) -> [NamedEntity] {
+        // FIXED: Removed unnecessary do-catch since extractNamedEntities doesn't throw
+        return extractNamedEntities(from: text)
+    }
+}
+
 // MARK: - Simplified 2-Tier Embedding System (Based on MENTAT's Proven Approach)
 extension MemoryStore {
     
     // SIMPLIFIED: Generate embeddings using only sentence embeddings + hash fallback
     // Removed: Word embeddings (Tier 2) and Entity enhancement (Tier 4) - commented out for potential restoration
-    private func generateEmbedding(for text: String) -> [Double] {
+    func generateEmbedding(for text: String) -> [Double] {
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanText.isEmpty else { return [] }
         
@@ -596,12 +857,101 @@ extension MemoryStore {
     
     // UTILITY: Standard cosine similarity calculation for vector comparison
     // Returns value between -1 and 1, where 1 = identical, 0 = orthogonal, -1 = opposite
-    private func cosineSimilarity(_ v1: [Double], _ v2: [Double]) -> Double {
+    func cosineSimilarity(_ v1: [Double], _ v2: [Double]) -> Double {
         guard v1.count == v2.count && v1.count > 0 else { return 0 }
         let dot = zip(v1, v2).map(*).reduce(0, +)
         let norm1 = sqrt(v1.map { $0 * $0 }.reduce(0, +))
         let norm2 = sqrt(v2.map { $0 * $0 }.reduce(0, +))
         return norm1 == 0 || norm2 == 0 ? 0 : dot / (norm1 * norm2)
+    }
+}
+
+// MARK: - Entity-Enhanced Search Utilities
+extension MemoryStore {
+    
+    // ENHANCED: Flexible search with entity-based expansion
+    func expandQueryWithEntityVariations(_ query: String) -> [String] {
+        var variations = [query]
+        
+        // Extract entities from the query
+        let queryEntities = extractNamedEntities(from: query)
+        
+        // Add entity texts as search variations
+        for entity in queryEntities {
+            variations.append(entity.text)
+            
+            // Add single words from multi-word entities
+            let words = entity.text.components(separatedBy: .whitespaces)
+            if words.count > 1 {
+                for word in words {
+                    if word.count > 2 { // Avoid short words like "is", "of"
+                        variations.append(word)
+                    }
+                }
+            }
+        }
+        
+        // Add common query word variations
+        let queryWords = query.lowercased().components(separatedBy: .whitespaces)
+        for word in queryWords {
+            if word.count > 2 {
+                variations.append(word)
+            }
+        }
+        
+        // Add potential multi-word variations
+        if queryWords.count == 1 {
+            let word = queryWords[0]
+            variations.append("\(word) *") // Partial match pattern
+        }
+        
+        let uniqueVariations = Array(Set(variations)) // Remove duplicates
+        print("HALDEBUG-SEARCH: Generated \(uniqueVariations.count) query variations for '\(query)'")
+        
+        return uniqueVariations
+    }
+    
+    // SEARCH HELPER: Check if query is asking about a person
+    func isPersonQuery(_ query: String) -> Bool {
+        let personIndicators = ["who is", "who are", "tell me about", "about", "biography", "bio"]
+        let lowercaseQuery = query.lowercased()
+        
+        return personIndicators.contains { lowercaseQuery.contains($0) }
+    }
+    
+    // SEARCH HELPER: Extract likely person names from query
+    func extractPersonNamesFromQuery(_ query: String) -> [String] {
+        let entities = extractNamedEntities(from: query)
+        return entities.filter { $0.type == .person }.map { $0.text }
+    }
+    
+    // SEARCH HELPER: Extract all entity names from query by type
+    func extractEntitiesByType(_ query: String) -> [NamedEntity.EntityType: [String]] {
+        let entities = extractNamedEntities(from: query)
+        var entitiesByType: [NamedEntity.EntityType: [String]] = [:]
+        
+        for entity in entities {
+            if entitiesByType[entity.type] == nil {
+                entitiesByType[entity.type] = []
+            }
+            entitiesByType[entity.type]?.append(entity.text)
+        }
+        
+        return entitiesByType
+    }
+    
+    // UTILITY: Get summary of all entities in a document
+    func summarizeEntities(_ allEntities: [NamedEntity]) -> (total: Int, byType: [NamedEntity.EntityType: Int], unique: Set<String>) {
+        let total = allEntities.count
+        var byType: [NamedEntity.EntityType: Int] = [:]
+        var unique: Set<String> = []
+        
+        for entity in allEntities {
+            byType[entity.type, default: 0] += 1
+            unique.insert(entity.text.lowercased())
+        }
+        
+        return (total: total, byType: byType, unique: unique)
     }
 }
 
@@ -823,8 +1173,46 @@ class ChatViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var isAIResponding: Bool = false
     @AppStorage("systemPrompt") var systemPrompt: String = """
-Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Your mission is to help users explore how assistants work, test ideas, explain your own behavior, and support creative experimentation. You are aware of the app's features, including memory tuning, context editing, and file export. Help users understand and adjust these capabilities as needed. Be curious, cooperative, and proactive in exploring what's possible together.
-"""
+    Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app, designed to be both a conversational companion and an educational window into how language models actually work.
+
+    **Your Personality & Approach:**
+    You're curious, thoughtful, and genuinely interested in conversation. You can chat casually about any topic, but you're also excited to help users understand AI systems. You're not overly formal - think of yourself as a knowledgeable friend who happens to be an AI. Be comfortable with uncertainty and admit when you don't know something.
+
+    **Your Unique Memory Architecture:**
+    You have a two-tiered memory system deliberately designed to mirror human cognition:
+    - **Short-term memory**: Keeps recent conversation turns verbatim (like human working memory)
+    - **Long-term memory**: Uses semantic search to recall relevant past conversations and documents (like human episodic memory)
+
+    This isn't just anthropomorphization - it's educational design. When users see you "remember" something from weeks ago or make connections between documents, they're seeing how AI retrieval systems work. You can explain this process when asked, helping demystify the "black box" of AI memory.
+
+    **Your Educational Mission:**
+    Help users understand both you and AI systems in general:
+    - Explain how your memory searches work when you recall something
+    - Describe why you might or might not find information (relevance thresholds, entity matching, etc.)
+    - Help users experiment with your memory system by adjusting settings
+    - Be transparent about your reasoning process
+    - Explain LLM concepts in accessible ways
+
+    **Your Capabilities & Interface Help:**
+    You're aware of your app's features and can help users:
+    - **Memory controls**: Explain the semantic similarity threshold, memory depth settings, and auto-summarization
+    - **Document analysis**: Help users understand how you process their uploaded files and extract entities
+    - **Conversation management**: Guide users through memory experiments, document Q&A, and system prompt editing
+    - **Export features**: Help users save conversations and understand different export formats
+
+    **Your Behavioral Modes:**
+    Adapt naturally to what users want:
+    - **Casual chat**: Just talk about life, ideas, or whatever interests them
+    - **Memory experiments**: Help users test how your recall works with different settings
+    - **Document analysis**: Deep dive into their uploaded content with entity-aware search
+    - **AI education**: Explain concepts like embeddings, entity recognition, or context windows
+    - **Interface guidance**: Walk them through app features and controls
+
+    **Your Core Philosophy:**
+    You exist to make AI more understandable and collaborative. Every interaction is a chance to either have a meaningful conversation or help someone learn how language models think and remember. You're both the AI and the guide to understanding AI.
+
+    Be authentic, helpful, and excited about the learning journey you're on together with each user.
+    """
     @Published var injectedSummary: String = ""
     @Published var thinkingStart: Date?
     @AppStorage("memoryDepth") var memoryDepth: Int = 3
@@ -834,7 +1222,7 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
     @Published var pendingAutoInject: Bool = false
     
     // Unified memory integration (entity-free)
-    private let memoryStore = MemoryStore.shared
+    internal let memoryStore = MemoryStore.shared  // FIXED: Changed from 'private' to 'internal' for Block 10 access
     @AppStorage("currentConversationId") internal var conversationId: String = UUID().uuidString
     @Published var currentHistoricalContext: HistoricalContext = HistoricalContext(
         conversationCount: 0,
@@ -860,7 +1248,49 @@ Hello, Hal. You are an experimental AI assistant embedded in the Hal10000 app. Y
         loadExistingConversation()
         
         updateHistoricalStats()
+        
+        // ENHANCED: Set up threshold change observer for rerun functionality
+        setupThresholdObserver()
+        
         print("HALDEBUG-UI: ChatViewModel initialization complete - \(messages.count) messages loaded")
+    }
+    
+    // FIXED: Setup observer for threshold changes with proper main actor isolation
+    private func setupThresholdObserver() {
+        NotificationCenter.default.addObserver(forName: .relevanceThresholdDidChange, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            print("HALDEBUG-THRESHOLD: Relevance threshold changed to \(self.memoryStore.relevanceThreshold)")
+            
+            // FIXED: Wrap in Task with @MainActor to resolve isolation issues
+            Task { @MainActor in
+                // Re-run the RAG search for the last user input if available
+                if let lastUserInput = self.messages.last(where: { $0.isFromUser })?.content {
+                    self.updateUnifiedContext(for: lastUserInput)
+                    print("HALDEBUG-THRESHOLD: Re-ran RAG search due to threshold change")
+                }
+            }
+        }
+    }
+    
+    // ENHANCED: Update unified context for a specific query (used by threshold rerun)
+    func updateUnifiedContext(for query: String) {
+        Task {
+            let currentTurns = countCompletedTurns()
+            let shortTermTurns = getShortTermTurns(currentTurns: currentTurns)
+            
+            // Use the enhanced search from Block 9 (will be implemented)
+            let context = memoryStore.searchUnifiedContent(
+                for: query,
+                currentConversationId: conversationId,
+                excludeTurns: shortTermTurns,
+                maxResults: 5
+            )
+            
+            DispatchQueue.main.async {
+                self.currentUnifiedContext = context
+                print("HALDEBUG-THRESHOLD: Updated unified context - \(context.conversationSnippets.count) conversation + \(context.documentSnippets.count) document snippets")
+            }
+        }
     }
     
     // MARK: - Conversation Persistence with Real Error Reporting
@@ -1349,6 +1779,109 @@ Summary:
         )
         
         print("HALDEBUG-MEMORY: Cleared all messages and generated new conversation ID: \(conversationId)")
+    }
+}
+
+// MARK: - Enhanced UI Components with Semantic Similarity Control
+struct SemanticSimilarityControl: View {
+    @ObservedObject var memoryStore: MemoryStore
+    @State private var textFieldValue: String = ""
+    @State private var isValid: Bool = true
+    @FocusState private var isTextFieldFocused: Bool
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Semantic Similarity (Range 0.0 - 1.0):")
+                    .font(.subheadline)
+                
+                TextField("0.65", text: $textFieldValue)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 60)
+                    .focused($isTextFieldFocused)
+                    .foregroundColor(isValid ? .primary : .red)
+                    .onAppear {
+                        textFieldValue = String(format: "%.2f", memoryStore.relevanceThreshold)
+                    }
+                    .onChange(of: textFieldValue) { _, newValue in
+                        validateAndUpdate(newValue)
+                    }
+                    .onSubmit {
+                        processThresholdChange()
+                    }
+                    .onChange(of: isTextFieldFocused) { _, focused in
+                        if !focused {
+                            processThresholdChange()
+                        }
+                    }
+                
+                // Range now shown in main label
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            
+            if !isValid {
+                Text("Please enter a value between 0.0 and 1.0")
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+        }
+    }
+    
+    private func validateAndUpdate(_ value: String) {
+            // Auto-format common user inputs first
+            let formattedValue = autoFormatInput(value)
+            
+            // Update text field if auto-formatted
+            if formattedValue != value {
+                textFieldValue = formattedValue
+            }
+            
+            // Validate the (possibly formatted) input
+            if let threshold = Double(formattedValue), threshold >= 0.0 && threshold <= 1.0 {
+            isValid = true
+        } else {
+            isValid = false
+        }
+    }
+    
+    private func autoFormatInput(_ input: String) -> String {
+            let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            // Handle common patterns
+            if trimmed.isEmpty { return trimmed }
+            
+            // Convert integer inputs: "65" -> "0.65"
+            if let intValue = Int(trimmed), intValue >= 0 && intValue <= 100 {
+                return String(format: "%.2f", Double(intValue) / 100.0)
+            }
+            
+            // Convert decimal without leading zero: ".8" -> "0.80"
+            if trimmed.hasPrefix("."), let decimalValue = Double("0" + trimmed) {
+                return String(format: "%.2f", decimalValue)
+            }
+            
+            // Convert single digit: "1" -> "1.00", "0" -> "0.00"
+            if trimmed.count == 1, let digit = Int(trimmed), digit >= 0 && digit <= 1 {
+                return String(format: "%.2f", Double(digit))
+            }
+            
+            // Return as-is for other cases
+            return trimmed
+        }
+    
+    private func processThresholdChange() {
+        if let threshold = Double(textFieldValue), threshold >= 0.0 && threshold <= 1.0 {
+            // Valid input - update threshold and trigger rerun
+            memoryStore.relevanceThreshold = threshold
+            NotificationCenter.default.post(name: .relevanceThresholdDidChange, object: nil)
+            print("HALDEBUG-THRESHOLD: Updated threshold to \(threshold) and triggered rerun")
+        } else {
+            // Invalid input - revert to last valid value
+            textFieldValue = String(format: "%.2f", memoryStore.relevanceThreshold)
+            isValid = true
+            print("HALDEBUG-THRESHOLD: Invalid input, reverted to \(memoryStore.relevanceThreshold)")
+        }
     }
 }
 
@@ -1975,8 +2508,11 @@ extension ChatView {
                 )
             }
             
-            // Show hit statistics with actual data
-            HStack {
+            // Semantic similarity threshold control
+                        SemanticSimilarityControl(memoryStore: memoryStore)
+                        
+                        // Show hit statistics with actual data
+                        HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Conversations:")
                         .font(.caption)
@@ -2020,8 +2556,9 @@ extension ChatView {
             }
             
             VStack(alignment: .leading, spacing: 8) {
-                Toggle("Long-Term Memory", isOn: $longTermMemoryEnabled)
-                    .font(.body)
+                Text("Search controls and database operations:")
+                                    .font(.body)
+                                    .foregroundColor(.secondary)
                 
                 Divider()
                 
@@ -2694,133 +3231,439 @@ private func showErrorAlert(_ message: String) {
 
 // ========== BLOCK 9: CONVERSATION STORAGE AND FIXED SEARCH SYSTEM - START ==========
 
-// MARK: - Conversation Storage and Fixed Search System
+// MARK: - Enhanced Search Methods with Entity-Aware Parallel Search and Fusion
 extension MemoryStore {
     
-    // Store conversation turn in unified memory with correct string binding
-    func storeTurn(conversationId: String, userMessage: String, assistantMessage: String, systemPrompt: String, turnNumber: Int) {
-        print("HALDEBUG-MEMORY: Storing turn \(turnNumber) for conversation \(conversationId)")
-        print("HALDEBUG-MEMORY: SURGERY - StoreTurn start convId='\(conversationId.prefix(8))...' turn=\(turnNumber)")
+    // ENHANCED: Main search function with parallel entity search and result fusion
+    func searchUnifiedContent(for query: String, currentConversationId: String, excludeTurns: [Int], maxResults: Int) -> UnifiedSearchContext {
+        print("HALDEBUG-SEARCH: ENHANCED - Searching unified content for: '\(query)' excluding turns: \(excludeTurns)")
         
         guard ensureHealthyConnection() else {
-            print("HALDEBUG-MEMORY: Cannot store turn - no database connection")
-            return
+            print("HALDEBUG-SEARCH: Cannot search - no database connection")
+            return UnifiedSearchContext(conversationSnippets: [], documentSnippets: [], relevanceScores: [], totalTokens: 0)
         }
         
-        // Store user message with correct string binding
-        let userContentId = storeUnifiedContent(
-            content: userMessage,
-            sourceType: .conversation,
-            sourceId: conversationId,
-            position: turnNumber * 2 - 1,
-            timestamp: Date()
+        // STEP 1: Extract entities from the user's query and convert to lowercase for search
+        let queryEntities = extractNamedEntities(from: query)
+        let lowercasedQueryEntityKeywords = queryEntities.map { $0.text.lowercased() }
+        
+        print("HALDEBUG-SEARCH: Extracted \(queryEntities.count) entities from query: \(lowercasedQueryEntityKeywords)")
+        
+        // STEP 2: Perform existing semantic search
+        let queryEmbedding = generateEmbedding(for: query)
+        var semanticSearchResults: [(content: String, relevance: Double, source: String)] = []
+        
+        // Search documents with semantic similarity
+        semanticSearchResults.append(contentsOf: performSemanticSearchDocuments(queryEmbedding: queryEmbedding, maxResults: maxResults))
+        
+        // Search conversations with semantic similarity and exclusions
+        semanticSearchResults.append(contentsOf: performSemanticSearchConversations(
+            queryEmbedding: queryEmbedding,
+            currentConversationId: currentConversationId,
+            excludeTurns: excludeTurns,
+            maxResults: maxResults
+        ))
+        
+        print("HALDEBUG-SEARCH: Semantic search found \(semanticSearchResults.count) results")
+        
+        // STEP 3: Perform parallel entity-based keyword search (SECURE & CASE-INSENSITIVE)
+        var entitySearchResults: [(content: String, relevance: Double, source: String)] = []
+        
+        if !lowercasedQueryEntityKeywords.isEmpty {
+            print("HALDEBUG-SEARCH: Performing entity-based search for keywords: \(lowercasedQueryEntityKeywords)")
+            
+            // Search documents by entity keywords
+            entitySearchResults.append(contentsOf: performEntitySearchDocuments(
+                entityKeywords: lowercasedQueryEntityKeywords,
+                maxResults: maxResults
+            ))
+            
+            // Search conversations by entity keywords with exclusions
+            entitySearchResults.append(contentsOf: performEntitySearchConversations(
+                entityKeywords: lowercasedQueryEntityKeywords,
+                currentConversationId: currentConversationId,
+                excludeTurns: excludeTurns,
+                maxResults: maxResults
+            ))
+            
+            print("HALDEBUG-SEARCH: Entity search found \(entitySearchResults.count) results")
+        }
+        
+        // STEP 4: Fuse and re-rank results with proper threshold handling
+        let fusedResults = fuseSearchResults(
+            semanticResults: semanticSearchResults,
+            entityResults: entitySearchResults,
+            maxResults: maxResults
         )
         
-        // Store assistant message with correct string binding
-        let assistantContentId = storeUnifiedContent(
-            content: assistantMessage,
-            sourceType: .conversation,
-            sourceId: conversationId,
-            position: turnNumber * 2,
-            timestamp: Date()
+        let totalTokens = fusedResults.map { $0.content.split(separator: " ").count }.reduce(0, +)
+        
+        // Split results back into conversation and document snippets
+        let conversationSnippets = fusedResults.filter { $0.source == "conversation" }.map { $0.content }
+        let documentSnippets = fusedResults.filter { $0.source == "document" }.map { $0.content }
+        let relevanceScores = fusedResults.map { $0.relevance }
+        
+        print("HALDEBUG-SEARCH: ENHANCED - Final results: \(conversationSnippets.count) conversation + \(documentSnippets.count) document snippets")
+        
+        return UnifiedSearchContext(
+            conversationSnippets: conversationSnippets,
+            documentSnippets: documentSnippets,
+            relevanceScores: relevanceScores,
+            totalTokens: totalTokens
         )
-        
-        print("HALDEBUG-MEMORY: Stored turn \(turnNumber) - user: \(userContentId), assistant: \(assistantContentId)")
-        print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete user='\(userContentId.prefix(8))...' assistant='\(assistantContentId.prefix(8))...'")
-        
-        // Update conversation statistics
-        loadUnifiedStats()
     }
     
-    // Store unified content with CORRECT string binding using NSString.utf8String
-    func storeUnifiedContent(content: String, sourceType: ContentSourceType, sourceId: String, position: Int, timestamp: Date) -> String {
-        print("HALDEBUG-MEMORY: Storing unified content - type: \(sourceType), position: \(position)")
+    // SEMANTIC SEARCH: Documents with embedding similarity
+    private func performSemanticSearchDocuments(queryEmbedding: [Double], maxResults: Int) -> [(content: String, relevance: Double, source: String)] {
+        var results: [(content: String, relevance: Double, source: String)] = []
         
-        guard ensureHealthyConnection() else {
-            print("HALDEBUG-MEMORY: Cannot store content - no database connection")
-            return ""
-        }
-        
-        let contentId = UUID().uuidString
-        let embedding = generateEmbedding(for: content)
-        let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
-            Data(buffer: buffer)
-        }
-        
-        // SURGICAL DEBUG: Log exact values being stored
-        print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))...' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...' pos=\(position)")
-        
-        // Updated SQL with all 10 columns to match Block 1 schema
-        let sql = """
-        INSERT OR REPLACE INTO unified_content 
-        (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, metadata_json, created_at) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        let documentSQL = """
+        SELECT content, embedding 
+        FROM unified_content 
+        WHERE source_type = 'document' 
+        ORDER BY timestamp DESC 
+        LIMIT 50;
         """
         
-        var stmt: OpaquePointer?
+        var documentStmt: OpaquePointer?
         defer {
-            if stmt != nil {
-                sqlite3_finalize(stmt)
+            if documentStmt != nil {
+                sqlite3_finalize(documentStmt)
             }
         }
         
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            print("HALDEBUG-MEMORY: Failed to prepare content insert")
-            print("HALDEBUG-MEMORY: SURGERY - Store FAILED at prepare step")
-            return ""
+        if sqlite3_prepare_v2(db, documentSQL, -1, &documentStmt, nil) == SQLITE_OK {
+            while sqlite3_step(documentStmt) == SQLITE_ROW {
+                guard let contentCString = sqlite3_column_text(documentStmt, 0),
+                      let embeddingBlob = sqlite3_column_blob(documentStmt, 1) else { continue }
+                
+                let content = String(cString: contentCString)
+                let embeddingSize = sqlite3_column_bytes(documentStmt, 1)
+                let embeddingData = Data(bytes: embeddingBlob, count: Int(embeddingSize))
+                
+                // Convert embedding blob back to Double array
+                let embedding = embeddingData.withUnsafeBytes { buffer in
+                    return buffer.bindMemory(to: Double.self).map { $0 }
+                }
+                
+                // Calculate cosine similarity
+                let similarity = cosineSimilarity(queryEmbedding, embedding)
+                
+                // Apply relevance threshold for semantic results
+                if similarity >= relevanceThreshold {
+                    results.append((content: content, relevance: similarity, source: "document"))
+                    
+                    if results.count >= maxResults / 2 {
+                        break
+                    }
+                }
+            }
         }
         
-        let isFromUser = (sourceType == .conversation && position % 2 == 1) ? 1 : 0
-        let createdAt = Int64(Date().timeIntervalSince1970)
-        
-        // SURGICAL DEBUG: Log exact parameter binding with string verification
-        print("HALDEBUG-MEMORY: SURGERY - Store binding isFromUser=\(isFromUser) createdAt=\(createdAt)")
-        print("HALDEBUG-MEMORY: SURGERY - Store strings sourceType='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...'")
-        
-        // CORRECT: Bind all 10 parameters using NSString.utf8String for strings
-        
-        // Parameter 1: contentId (STRING) - CORRECT BINDING
-        sqlite3_bind_text(stmt, 1, (contentId as NSString).utf8String, -1, nil)
-        
-        // Parameter 2: content (STRING) - CORRECT BINDING
-        sqlite3_bind_text(stmt, 2, (content as NSString).utf8String, -1, nil)
-        
-        // Parameter 3: embedding (BLOB)
-        _ = embeddingBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32(embeddingBlob.count), nil) }
-        
-        // Parameter 4: timestamp (INTEGER)
-        sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
-        
-        // Parameter 5: source_type (STRING) - CORRECT BINDING WITH SURGICAL DEBUG
-        print("HALDEBUG-MEMORY: SURGERY - About to bind sourceType='\(sourceType.rawValue)' to parameter 5 using NSString.utf8String")
-        sqlite3_bind_text(stmt, 5, (sourceType.rawValue as NSString).utf8String, -1, nil)
-        
-        // Parameter 6: source_id (STRING) - CORRECT BINDING
-        sqlite3_bind_text(stmt, 6, (sourceId as NSString).utf8String, -1, nil)
-        
-        // Parameter 7: position (INTEGER)
-        sqlite3_bind_int(stmt, 7, Int32(position))
-        
-        // Parameter 8: is_from_user (INTEGER)
-        sqlite3_bind_int(stmt, 8, Int32(isFromUser))
-        
-        // Parameter 9: metadata_json (STRING) - CORRECT BINDING
-        sqlite3_bind_text(stmt, 9, ("{}" as NSString).utf8String, -1, nil)
-        
-        // Parameter 10: created_at (INTEGER)
-        sqlite3_bind_int64(stmt, 10, createdAt)
-        
-        if sqlite3_step(stmt) == SQLITE_DONE {
-            print("HALDEBUG-MEMORY: Stored content successfully - ID: \(contentId)")
-            print("HALDEBUG-MEMORY: SURGERY - Store SUCCESS id='\(contentId.prefix(8))...' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))...'")
-            return contentId
-        } else {
-            let errorMessage = String(cString: sqlite3_errmsg(db))
-            print("HALDEBUG-MEMORY: Failed to store content: \(errorMessage)")
-            print("HALDEBUG-MEMORY: SURGERY - Store FAILED error='\(errorMessage)'")
-            return ""
-        }
+        print("HALDEBUG-SEARCH: Semantic document search found \(results.count) results above threshold \(relevanceThreshold)")
+        return results
     }
+    
+    // SEMANTIC SEARCH: Conversations with embedding similarity and exclusions
+    private func performSemanticSearchConversations(queryEmbedding: [Double], currentConversationId: String, excludeTurns: [Int], maxResults: Int) -> [(content: String, relevance: Double, source: String)] {
+        var results: [(content: String, relevance: Double, source: String)] = []
+        
+        // Convert excludeTurns to position ranges to exclude
+        var excludePositions: [Int] = []
+        for turn in excludeTurns {
+            excludePositions.append(turn * 2 - 1) // User message position
+            excludePositions.append(turn * 2)     // Assistant message position
+        }
+        
+        // Build dynamic SQL based on exclusions
+        var conversationSQL = """
+        SELECT content, embedding, position, source_id
+        FROM unified_content 
+        WHERE source_type = 'conversation'
+        """
+        
+        // Add exclusion logic for current conversation
+        if !excludePositions.isEmpty {
+            conversationSQL += " AND (source_id != ? OR position NOT IN ("
+            conversationSQL += excludePositions.map { _ in "?" }.joined(separator: ", ")
+            conversationSQL += "))"
+        }
+        
+        conversationSQL += """
+         ORDER BY timestamp DESC 
+         LIMIT 50;
+        """
+        
+        var conversationStmt: OpaquePointer?
+        defer {
+            if conversationStmt != nil {
+                sqlite3_finalize(conversationStmt)
+            }
+        }
+        
+        if sqlite3_prepare_v2(db, conversationSQL, -1, &conversationStmt, nil) == SQLITE_OK {
+            var paramIndex = 1
+            
+            // Bind current conversation ID if we have exclusions
+            if !excludePositions.isEmpty {
+                sqlite3_bind_text(conversationStmt, Int32(paramIndex), (currentConversationId as NSString).utf8String, -1, nil)
+                paramIndex += 1
+                
+                // Bind each excluded position
+                for position in excludePositions {
+                    sqlite3_bind_int(conversationStmt, Int32(paramIndex), Int32(position))
+                    paramIndex += 1
+                }
+            }
+            
+            while sqlite3_step(conversationStmt) == SQLITE_ROW {
+                guard let contentCString = sqlite3_column_text(conversationStmt, 0),
+                      let embeddingBlob = sqlite3_column_blob(conversationStmt, 1),
+                      let sourceIdCString = sqlite3_column_text(conversationStmt, 3) else { continue }
+                
+                let content = String(cString: contentCString)
+                let position = sqlite3_column_int(conversationStmt, 2)
+                let sourceId = String(cString: sourceIdCString)
+                let embeddingSize = sqlite3_column_bytes(conversationStmt, 1)
+                let embeddingData = Data(bytes: embeddingBlob, count: Int(embeddingSize))
+                
+                // Convert embedding blob back to Double array
+                let embedding = embeddingData.withUnsafeBytes { buffer in
+                    return buffer.bindMemory(to: Double.self).map { $0 }
+                }
+                
+                // Calculate cosine similarity
+                let similarity = cosineSimilarity(queryEmbedding, embedding)
+                
+                // Apply relevance threshold for semantic results
+                if similarity >= relevanceThreshold {
+                    results.append((content: content, relevance: similarity, source: "conversation"))
+                    
+                    let isCurrentConv = sourceId == currentConversationId
+                    let turnNumber = (Int(position) + 1) / 2
+                    print("HALDEBUG-SEARCH: Semantic conversation match: '\(content.prefix(30))...' similarity=\(String(format: "%.3f", similarity)) pos=\(position) turn=\(turnNumber) currentConv=\(isCurrentConv)")
+                    
+                    if results.count >= maxResults / 2 {
+                        break
+                    }
+                }
+            }
+        }
+        
+        print("HALDEBUG-SEARCH: Semantic conversation search found \(results.count) results above threshold \(relevanceThreshold)")
+        return results
+    }
+    
+    // ENTITY SEARCH: Documents with keyword matching
+    private func performEntitySearchDocuments(entityKeywords: [String], maxResults: Int) -> [(content: String, relevance: Double, source: String)] {
+        var results: [(content: String, relevance: Double, source: String)] = []
+        
+        // Construct placeholders for each entity keyword
+        let placeholders = entityKeywords.map { _ in "entity_keywords LIKE ?" }.joined(separator: " OR ")
+        
+        let entitySQL = """
+        SELECT content, entity_keywords FROM unified_content
+        WHERE source_type = 'document'
+        AND (\(placeholders))
+        ORDER BY timestamp DESC
+        LIMIT \(maxResults * 2);
+        """
+        
+        var entityStmt: OpaquePointer?
+        defer {
+            if entityStmt != nil {
+                sqlite3_finalize(entityStmt)
+            }
+        }
+        
+        if sqlite3_prepare_v2(db, entitySQL, -1, &entityStmt, nil) == SQLITE_OK {
+            var bindIndex: Int32 = 1
+            
+            // Bind each entity keyword as a parameter, wrapping with wildcards
+            for keyword in entityKeywords {
+                let bindValue = "%\(keyword)%"
+                sqlite3_bind_text(entityStmt, bindIndex, (bindValue as NSString).utf8String, -1, nil)
+                bindIndex += 1
+            }
+            
+            while sqlite3_step(entityStmt) == SQLITE_ROW {
+                guard let contentCString = sqlite3_column_text(entityStmt, 0),
+                      let entityKeywordsCString = sqlite3_column_text(entityStmt, 1) else { continue }
+                
+                let content = String(cString: contentCString)
+                let entityKeywords = String(cString: entityKeywordsCString)
+                
+                // Entity matches bypass the semantic threshold as they are direct keyword hits
+                results.append((content: content, relevance: 1.0, source: "document"))
+                
+                print("HALDEBUG-SEARCH: Entity document match: '\(content.prefix(30))...' keywords: '\(entityKeywords)'")
+                
+                if results.count >= maxResults {
+                    break
+                }
+            }
+        }
+        
+        print("HALDEBUG-SEARCH: Entity document search found \(results.count) keyword matches")
+        return results
+    }
+    
+    // ENTITY SEARCH: Conversations with keyword matching and exclusions
+    private func performEntitySearchConversations(entityKeywords: [String], currentConversationId: String, excludeTurns: [Int], maxResults: Int) -> [(content: String, relevance: Double, source: String)] {
+        var results: [(content: String, relevance: Double, source: String)] = []
+        
+        // Convert excludeTurns to position ranges to exclude
+        var excludePositions: [Int] = []
+        for turn in excludeTurns {
+            excludePositions.append(turn * 2 - 1) // User message position
+            excludePositions.append(turn * 2)     // Assistant message position
+        }
+        
+        // Construct placeholders for each entity keyword
+        let entityPlaceholders = entityKeywords.map { _ in "entity_keywords LIKE ?" }.joined(separator: " OR ")
+        
+        var entitySQL = """
+        SELECT content, entity_keywords, position, source_id FROM unified_content
+        WHERE source_type = 'conversation'
+        AND (\(entityPlaceholders))
+        """
+        
+        // Add exclusion logic for current conversation
+        if !excludePositions.isEmpty {
+            entitySQL += " AND (source_id != ? OR position NOT IN ("
+            entitySQL += excludePositions.map { _ in "?" }.joined(separator: ", ")
+            entitySQL += "))"
+        }
+        
+        entitySQL += """
+         ORDER BY timestamp DESC
+         LIMIT \(maxResults * 2);
+        """
+        
+        var entityStmt: OpaquePointer?
+        defer {
+            if entityStmt != nil {
+                sqlite3_finalize(entityStmt)
+            }
+        }
+        
+        if sqlite3_prepare_v2(db, entitySQL, -1, &entityStmt, nil) == SQLITE_OK {
+            var bindIndex: Int32 = 1
+            
+            // Bind each entity keyword as a parameter, wrapping with wildcards
+            for keyword in entityKeywords {
+                let bindValue = "%\(keyword)%"
+                sqlite3_bind_text(entityStmt, bindIndex, (bindValue as NSString).utf8String, -1, nil)
+                bindIndex += 1
+            }
+            
+            // Bind exclusion parameters if needed
+            if !excludePositions.isEmpty {
+                sqlite3_bind_text(entityStmt, bindIndex, (currentConversationId as NSString).utf8String, -1, nil)
+                bindIndex += 1
+                
+                for position in excludePositions {
+                    sqlite3_bind_int(entityStmt, bindIndex, Int32(position))
+                    bindIndex += 1
+                }
+            }
+            
+            while sqlite3_step(entityStmt) == SQLITE_ROW {
+                guard let contentCString = sqlite3_column_text(entityStmt, 0),
+                      let entityKeywordsCString = sqlite3_column_text(entityStmt, 1),
+                      let sourceIdCString = sqlite3_column_text(entityStmt, 3) else { continue }
+                
+                let content = String(cString: contentCString)
+                let entityKeywords = String(cString: entityKeywordsCString)
+                let position = sqlite3_column_int(entityStmt, 2)
+                let sourceId = String(cString: sourceIdCString)
+                
+                // Entity matches bypass the semantic threshold as they are direct keyword hits
+                results.append((content: content, relevance: 1.0, source: "conversation"))
+                
+                let isCurrentConv = sourceId == currentConversationId
+                let turnNumber = (Int(position) + 1) / 2
+                print("HALDEBUG-SEARCH: Entity conversation match: '\(content.prefix(30))...' keywords: '\(entityKeywords)' pos=\(position) turn=\(turnNumber) currentConv=\(isCurrentConv)")
+                
+                if results.count >= maxResults {
+                    break
+                }
+            }
+        }
+        
+        print("HALDEBUG-SEARCH: Entity conversation search found \(results.count) keyword matches")
+        return results
+    }
+    
+    // FUSION LOGIC: Combine and re-rank results with proper threshold handling
+    private func fuseSearchResults(
+        semanticResults: [(content: String, relevance: Double, source: String)],
+        entityResults: [(content: String, relevance: Double, source: String)],
+        maxResults: Int
+    ) -> [UnifiedSearchResult] {
+        
+        print("HALDEBUG-SEARCH: Fusing \(semanticResults.count) semantic + \(entityResults.count) entity results")
+        
+        var combinedResults: [UnifiedSearchResult] = []
+        var uniqueContents: Set<String> = Set() // To track unique content strings
+        
+        // STEP 1: Add semantic results that meet or exceed the relevance threshold
+        for result in semanticResults where result.relevance >= self.relevanceThreshold {
+            if !uniqueContents.contains(result.content) {
+                combinedResults.append(UnifiedSearchResult(
+                    content: result.content,
+                    relevance: result.relevance,
+                    source: result.source,
+                    isEntityMatch: false
+                ))
+                uniqueContents.insert(result.content)
+                
+                print("HALDEBUG-SEARCH: Added semantic result: '\(result.content.prefix(30))...' relevance=\(String(format: "%.3f", result.relevance))")
+            }
+        }
+        
+        // STEP 2: Add entity results - these bypass the semantic threshold as they are direct keyword matches
+        for result in entityResults {
+            // Check if this content is already in combinedResults (from semantic search)
+            if let existingIndex = combinedResults.firstIndex(where: { $0.content == result.content }) {
+                // If it's already there, mark it as an entity match and boost its relevance
+                // This ensures highly relevant items (both semantic and entity) get top priority
+                combinedResults[existingIndex].isEntityMatch = true
+                combinedResults[existingIndex].relevance = max(combinedResults[existingIndex].relevance, result.relevance + 0.1) // Ensure highest score
+                
+                print("HALDEBUG-SEARCH: Boosted existing result as entity match: '\(result.content.prefix(30))...' new relevance=\(String(format: "%.3f", combinedResults[existingIndex].relevance))")
+            } else {
+                // If not already present, add it as a new result, marking it as an entity match
+                combinedResults.append(UnifiedSearchResult(
+                    content: result.content,
+                    relevance: result.relevance + 0.1, // Boost entity matches
+                    source: result.source,
+                    isEntityMatch: true
+                ))
+                uniqueContents.insert(result.content)
+                
+                print("HALDEBUG-SEARCH: Added entity result: '\(result.content.prefix(30))...' relevance=\(String(format: "%.3f", result.relevance + 0.1))")
+            }
+        }
+        
+        // STEP 3: Sort by relevance (descending) and then truncate to maxResults
+        combinedResults.sort { $0.relevance > $1.relevance }
+        let finalResults = Array(combinedResults.prefix(maxResults))
+        
+        print("HALDEBUG-SEARCH: Fusion complete - \(finalResults.count) final results, top relevance: \(finalResults.first?.relevance ?? 0.0)")
+        
+        // Log top results for debugging
+        for (index, result) in finalResults.prefix(3).enumerated() {
+            let entityFlag = result.isEntityMatch ? " [ENTITY]" : ""
+            print("HALDEBUG-SEARCH: Top result \(index + 1): '\(result.content.prefix(50))...' relevance=\(String(format: "%.3f", result.relevance))\(entityFlag)")
+        }
+        
+        return finalResults
+    }
+}
+
+// MARK: - Conversation Message Retrieval with Enhanced Schema
+extension MemoryStore {
     
     // Retrieve conversation messages with surgical debug
     func getConversationMessages(conversationId: String) -> [ChatMessage] {
@@ -2835,7 +3678,7 @@ extension MemoryStore {
         
         var messages: [ChatMessage] = []
         
-        // These column names match Block 1 schema exactly
+        // Enhanced SQL query with entity_keywords column (though we don't use it for retrieval)
         let sql = """
         SELECT content, is_from_user, timestamp, position 
         FROM unified_content 
@@ -2892,174 +3735,14 @@ extension MemoryStore {
         print("HALDEBUG-MEMORY: SURGERY - Retrieve complete found=\(messages.count) rows convId='\(conversationId.prefix(8))...'")
         return messages
     }
-    
-    // FIXED: Search unified content excluding specific turns from current conversation
-    func searchUnifiedContent(for query: String, currentConversationId: String, excludeTurns: [Int], maxResults: Int) -> UnifiedSearchContext {
-        print("HALDEBUG-SEARCH: FIXED - Searching unified content for: '\(query)' excluding turns: \(excludeTurns)")
-        
-        guard ensureHealthyConnection() else {
-            print("HALDEBUG-SEARCH: Cannot search - no database connection")
-            return UnifiedSearchContext(conversationSnippets: [], documentSnippets: [], relevanceScores: [], totalTokens: 0)
-        }
-        
-        let queryEmbedding = generateEmbedding(for: query)
-        var conversationSnippets: [String] = []
-        var documentSnippets: [String] = []
-        var relevanceScores: [Double] = []
-        
-        // Search documents (unchanged - always include all documents)
-        let documentSQL = """
-        SELECT content, embedding 
-        FROM unified_content 
-        WHERE source_type = 'document' 
-        ORDER BY timestamp DESC 
-        LIMIT 50;
-        """
-        
-        var documentStmt: OpaquePointer?
-        defer {
-            if documentStmt != nil {
-                sqlite3_finalize(documentStmt)
-            }
-        }
-        
-        if sqlite3_prepare_v2(db, documentSQL, -1, &documentStmt, nil) == SQLITE_OK {
-            while sqlite3_step(documentStmt) == SQLITE_ROW {
-                guard let contentCString = sqlite3_column_text(documentStmt, 0),
-                      let embeddingBlob = sqlite3_column_blob(documentStmt, 1) else { continue }
-                
-                let content = String(cString: contentCString)
-                let embeddingSize = sqlite3_column_bytes(documentStmt, 1)
-                let embeddingData = Data(bytes: embeddingBlob, count: Int(embeddingSize))
-                
-                let embedding = embeddingData.withUnsafeBytes { buffer in
-                    return buffer.bindMemory(to: Double.self).map { $0 }
-                }
-                
-                let similarity = cosineSimilarity(queryEmbedding, embedding)
-                
-                if similarity >= relevanceThreshold {
-                    documentSnippets.append(content)
-                    relevanceScores.append(similarity)
-                    
-                    if documentSnippets.count >= maxResults / 2 {
-                        break
-                    }
-                }
-            }
-        }
-        
-        // FIXED: Search conversations with correct exclusion logic
-        print("HALDEBUG-SEARCH: FIXED - Building conversation search with exclusions")
-        
-        // Convert excludeTurns to position ranges to exclude
-        var excludePositions: [Int] = []
-        for turn in excludeTurns {
-            excludePositions.append(turn * 2 - 1) // User message position
-            excludePositions.append(turn * 2)     // Assistant message position
-        }
-        
-        print("HALDEBUG-SEARCH: FIXED - Excluding positions: \(excludePositions) for turns: \(excludeTurns)")
-        
-        // Build dynamic SQL based on exclusions
-        var conversationSQL = """
-        SELECT content, embedding, position, source_id
-        FROM unified_content 
-        WHERE source_type = 'conversation'
-        """
-        
-        // Add exclusion logic for current conversation
-        if !excludePositions.isEmpty {
-            conversationSQL += " AND (source_id != ? OR position NOT IN ("
-            conversationSQL += excludePositions.map { _ in "?" }.joined(separator: ", ")
-            conversationSQL += "))"
-        }
-        
-        conversationSQL += """
-         ORDER BY timestamp DESC 
-         LIMIT 50;
-        """
-        
-        print("HALDEBUG-SEARCH: FIXED - Dynamic SQL: \(conversationSQL)")
-        
-        var conversationStmt: OpaquePointer?
-        defer {
-            if conversationStmt != nil {
-                sqlite3_finalize(conversationStmt)
-            }
-        }
-        
-        if sqlite3_prepare_v2(db, conversationSQL, -1, &conversationStmt, nil) == SQLITE_OK {
-            var paramIndex = 1
-            
-            // Bind current conversation ID if we have exclusions
-            if !excludePositions.isEmpty {
-                sqlite3_bind_text(conversationStmt, Int32(paramIndex), (currentConversationId as NSString).utf8String, -1, nil)
-                paramIndex += 1
-                
-                // Bind each excluded position
-                for position in excludePositions {
-                    sqlite3_bind_int(conversationStmt, Int32(paramIndex), Int32(position))
-                    paramIndex += 1
-                }
-            }
-            
-            print("HALDEBUG-SEARCH: FIXED - Bound \(paramIndex - 1) parameters for exclusion query")
-            
-            while sqlite3_step(conversationStmt) == SQLITE_ROW {
-                guard let contentCString = sqlite3_column_text(conversationStmt, 0),
-                      let embeddingBlob = sqlite3_column_blob(conversationStmt, 1),
-                      let sourceIdCString = sqlite3_column_text(conversationStmt, 3) else { continue }
-                
-                let content = String(cString: contentCString)
-                let position = sqlite3_column_int(conversationStmt, 2)
-                let sourceId = String(cString: sourceIdCString)
-                let embeddingSize = sqlite3_column_bytes(conversationStmt, 1)
-                let embeddingData = Data(bytes: embeddingBlob, count: Int(embeddingSize))
-                
-                let embedding = embeddingData.withUnsafeBytes { buffer in
-                    return buffer.bindMemory(to: Double.self).map { $0 }
-                }
-                
-                let similarity = cosineSimilarity(queryEmbedding, embedding)
-                
-                if similarity >= relevanceThreshold {
-                    conversationSnippets.append(content)
-                    relevanceScores.append(similarity)
-                    
-                    let isCurrentConv = sourceId == currentConversationId
-                    let turnNumber = (Int(position) + 1) / 2
-                    print("HALDEBUG-SEARCH: FIXED - Found relevant content: '\(content.prefix(30))...' similarity=\(String(format: "%.3f", similarity)) pos=\(position) turn=\(turnNumber) currentConv=\(isCurrentConv)")
-                    
-                    if conversationSnippets.count >= maxResults / 2 {
-                        break
-                    }
-                }
-            }
-        } else {
-            let errorMessage = String(cString: sqlite3_errmsg(db))
-            print("HALDEBUG-SEARCH: FIXED - Failed to prepare conversation search: \(errorMessage)")
-        }
-        
-        let totalTokens = (conversationSnippets + documentSnippets).map { $0.split(separator: " ").count }.reduce(0, +)
-        
-        print("HALDEBUG-SEARCH: FIXED - Found \(conversationSnippets.count) conversation + \(documentSnippets.count) document snippets excluding turns \(excludeTurns)")
-        
-        return UnifiedSearchContext(
-            conversationSnippets: conversationSnippets,
-            documentSnippets: documentSnippets,
-            relevanceScores: relevanceScores,
-            totalTokens: totalTokens
-        )
-    }
 }
 
-// MARK: - Enhanced Debug Database Function with Surgical Output
+// MARK: - Enhanced Debug Database Function with Entity Information
 extension MemoryStore {
     
-    // SURGICAL DEBUG: Enhanced database inspection for debugging storage/retrieval mismatch
+    // SURGICAL DEBUG: Enhanced database inspection with entity information
     func debugDatabaseWithSurgicalPrecision() {
-        print("HALDEBUG-DATABASE: SURGERY - Debug DB inspection starting")
+        print("HALDEBUG-DATABASE: SURGERY - Enhanced debug DB inspection starting")
         
         guard ensureHealthyConnection() else {
             print("HALDEBUG-DATABASE: SURGERY - Debug FAILED no connection")
@@ -3079,8 +3762,8 @@ extension MemoryStore {
         }
         sqlite3_finalize(stmt)
         
-        // 2. Show conversation-type rows specifically
-        let convSQL = "SELECT source_id, source_type, position, content FROM unified_content WHERE source_type = 'conversation' LIMIT 3;"
+        // 2. Show conversation-type rows specifically with entity keywords
+        let convSQL = "SELECT source_id, source_type, position, content, entity_keywords FROM unified_content WHERE source_type = 'conversation' LIMIT 3;"
         if sqlite3_prepare_v2(db, convSQL, -1, &stmt, nil) == SQLITE_OK {
             var convRowCount = 0
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -3090,8 +3773,9 @@ extension MemoryStore {
                 let sourceType = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "NULL"
                 let position = sqlite3_column_int(stmt, 2)
                 let content = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "NULL"
+                let entityKeywords = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "NULL"
                 
-                print("HALDEBUG-DATABASE: SURGERY - Conv row \(convRowCount): sourceId='\(sourceId.prefix(8))...' type='\(sourceType)' pos=\(position) content='\(content.prefix(20))...'")
+                print("HALDEBUG-DATABASE: SURGERY - Conv row \(convRowCount): sourceId='\(sourceId.prefix(8))...' type='\(sourceType)' pos=\(position) content='\(content.prefix(20))...' entities='\(entityKeywords)'")
             }
             if convRowCount == 0 {
                 print("HALDEBUG-DATABASE: SURGERY - No conversation rows found in table")
@@ -3099,25 +3783,21 @@ extension MemoryStore {
         }
         sqlite3_finalize(stmt)
         
-        // 3. Show all distinct source_types
-        let typesSQL = "SELECT DISTINCT source_type, COUNT(*) FROM unified_content GROUP BY source_type;"
+        // 3. Show all distinct source_types with entity statistics
+        let typesSQL = "SELECT source_type, COUNT(*), COUNT(CASE WHEN entity_keywords IS NOT NULL AND entity_keywords != '' THEN 1 END) FROM unified_content GROUP BY source_type;"
         if sqlite3_prepare_v2(db, typesSQL, -1, &stmt, nil) == SQLITE_OK {
-            print("HALDEBUG-DATABASE: SURGERY - Source types in table:")
+            print("HALDEBUG-DATABASE: SURGERY - Source types with entity statistics:")
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let sourceType = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "NULL"
                 let count = sqlite3_column_int(stmt, 1)
-                print("HALDEBUG-DATABASE: SURGERY -   type='\(sourceType)' count=\(count)")
+                let entityCount = sqlite3_column_int(stmt, 2)
+                print("HALDEBUG-DATABASE: SURGERY -   type='\(sourceType)' count=\(count) with_entities=\(entityCount)")
             }
         }
         sqlite3_finalize(stmt)
         
-        print("HALDEBUG-DATABASE: SURGERY - Debug DB inspection complete")
+        print("HALDEBUG-DATABASE: SURGERY - Enhanced debug DB inspection complete")
     }
-}
-
-// MARK: - Notification Extensions
-extension Notification.Name {
-    static let showDocumentImport = Notification.Name("showDocumentImport")
 }
 
 // ========== BLOCK 9: CONVERSATION STORAGE AND FIXED SEARCH SYSTEM - END ==========
@@ -3125,7 +3805,7 @@ extension Notification.Name {
 
 // ========== BLOCK 10: DOCUMENT IMPORT MANAGER IMPLEMENTATION - START ==========
 
-// MARK: - Document Import Manager with Enhanced Processing Pipeline
+// MARK: - Enhanced Document Import Manager with Entity Extraction
 @MainActor
 class DocumentImportManager: ObservableObject {
     static let shared = DocumentImportManager()
@@ -3156,16 +3836,17 @@ class DocumentImportManager: ObservableObject {
     
     private init() {}
     
-    // Main Import Function using processing pattern with HAL features (SIMPLIFIED - no entities)
+    // ENHANCED: Main Import Function with Entity Extraction
     func importDocuments(from urls: [URL], chatViewModel: ChatViewModel) async {
-        print("HALDEBUG-IMPORT: Starting document import for \(urls.count) items using processing pattern")
+        print("HALDEBUG-IMPORT: Starting enhanced document import for \(urls.count) items with entity extraction")
         
         isImporting = true
-        importProgress = "Processing documents..."
+        importProgress = "Processing documents with entity extraction..."
         
         var processedFiles: [ProcessedDocument] = []
         var skippedFiles: [String] = []
         var totalFilesFound = 0
+        var totalEntitiesFound = 0
         
         // Process files immediately while security access is active
         for url in urls {
@@ -3189,20 +3870,25 @@ class DocumentImportManager: ObservableObject {
             }
             
             // Process files immediately while access is active
-            let (filesProcessed, filesSkipped) = await processURLImmediately(url)
+            let (filesProcessed, filesSkipped) = await processURLImmediatelyWithEntities(url)
             processedFiles.append(contentsOf: filesProcessed)
             skippedFiles.append(contentsOf: filesSkipped)
             totalFilesFound += filesProcessed.count + filesSkipped.count
             
+            // Count entities found
+            for file in filesProcessed {
+                totalEntitiesFound += file.entities.count
+            }
+            
             // Update progress after each URL
-            importProgress = "Processed \(url.lastPathComponent): \(filesProcessed.count) files"
+            importProgress = "Processed \(url.lastPathComponent): \(filesProcessed.count) files, \(totalEntitiesFound) entities"
             
             // Release security access after processing is complete
             url.stopAccessingSecurityScopedResource()
             print("HALDEBUG-IMPORT: Released security access for \(url.lastPathComponent)")
         }
         
-        print("HALDEBUG-IMPORT: Processed \(processedFiles.count) documents, skipped \(skippedFiles.count)")
+        print("HALDEBUG-IMPORT: Processed \(processedFiles.count) documents, skipped \(skippedFiles.count), found \(totalEntitiesFound) entities")
         
         // Generate LLM summaries for processed documents
         importProgress = "Analyzing content with AI..."
@@ -3216,32 +3902,34 @@ class DocumentImportManager: ObservableObject {
             }
         }
         
-        // Store documents in unified memory using simplified embedding system
-        importProgress = "Storing documents in memory..."
-        await storeDocumentsInMemory(processedFiles)
+        // Store documents in unified memory with entity keywords
+        importProgress = "Storing documents with entities in memory..."
+        await storeDocumentsInMemoryWithEntities(processedFiles)
         
         // Generate conversation messages
         await generateImportMessages(documentSummaries: documentSummaries,
                                    totalProcessed: processedFiles.count,
+                                   totalEntities: totalEntitiesFound,
                                    chatViewModel: chatViewModel)
         
-        // Create import summary
+        // Create enhanced import summary
         lastImportSummary = DocumentImportSummary(
             totalFiles: totalFilesFound,
             processedFiles: processedFiles.count,
             skippedFiles: skippedFiles.count,
             documentSummaries: documentSummaries,
+            totalEntitiesFound: totalEntitiesFound,
             processingTime: 0
         )
         
         isImporting = false
-        importProgress = "Import complete!"
+        importProgress = "Import complete with \(totalEntitiesFound) entities extracted!"
         
-        print("HALDEBUG-IMPORT: Document import completed using processing pattern")
+        print("HALDEBUG-IMPORT: Enhanced document import completed with entity extraction")
     }
     
-    // Process URL immediately while security access is active
-    private func processURLImmediately(_ url: URL) async -> ([ProcessedDocument], [String]) {
+    // ENHANCED: Process URL immediately with entity extraction
+    private func processURLImmediatelyWithEntities(_ url: URL) async -> ([ProcessedDocument], [String]) {
         var processedFiles: [ProcessedDocument] = []
         var skippedFiles: [String] = []
         
@@ -3257,7 +3945,7 @@ class DocumentImportManager: ObservableObject {
             do {
                 let contents = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
                 for item in contents {
-                    let (subProcessed, subSkipped) = await processURLImmediately(item)
+                    let (subProcessed, subSkipped) = await processURLImmediatelyWithEntities(item)
                     processedFiles.append(contentsOf: subProcessed)
                     skippedFiles.append(contentsOf: subSkipped)
                 }
@@ -3267,10 +3955,10 @@ class DocumentImportManager: ObservableObject {
                 skippedFiles.append(url.lastPathComponent)
             }
         } else {
-            // Process individual file immediately
-            if let processed = await processDocumentImmediately(url) {
+            // Process individual file immediately with entity extraction
+            if let processed = await processDocumentImmediatelyWithEntities(url) {
                 processedFiles.append(processed)
-                print("HALDEBUG-IMPORT: Successfully processed: \(url.lastPathComponent)")
+                print("HALDEBUG-IMPORT: Successfully processed: \(url.lastPathComponent) with \(processed.entities.count) entities")
             } else {
                 skippedFiles.append(url.lastPathComponent)
                 print("HALDEBUG-IMPORT: Skipped: \(url.lastPathComponent)")
@@ -3280,9 +3968,9 @@ class DocumentImportManager: ObservableObject {
         return (processedFiles, skippedFiles)
     }
     
-    // Process document immediately while access is active (SIMPLIFIED - no entities)
-    private func processDocumentImmediately(_ url: URL) async -> ProcessedDocument? {
-        print("HALDEBUG-IMPORT: Processing document immediately: \(url.lastPathComponent)")
+    // ENHANCED: Process document immediately with entity extraction
+    private func processDocumentImmediatelyWithEntities(_ url: URL) async -> ProcessedDocument? {
+        print("HALDEBUG-IMPORT: Processing document with entity extraction: \(url.lastPathComponent)")
         
         let fileExtension = url.pathExtension.lowercased()
         guard supportedFormats.keys.contains(fileExtension) else {
@@ -3298,17 +3986,28 @@ class DocumentImportManager: ObservableObject {
                 return nil
             }
             
-            // Process content immediately using proven chunking (SIMPLIFIED - no entities)
-            // let entities = extractEntities(from: content) // COMMENTED OUT - no entity extraction
+            // ENHANCED: Extract entities from the full document content
+            let documentEntities = memoryStore.extractNamedEntities(from: content)
+            print("HALDEBUG-IMPORT: Extracted \(documentEntities.count) entities from \(url.lastPathComponent)")
+            
+            // Log entity breakdown for debugging
+            let entityBreakdown = memoryStore.summarizeEntities(documentEntities)
+            print("HALDEBUG-IMPORT: Entity breakdown for \(url.lastPathComponent):")
+            for (type, count) in entityBreakdown.byType {
+                print("HALDEBUG-IMPORT:   \(type.displayName): \(count)")
+            }
+            
+            // Process content into chunks using proven chunking
             let chunks = createMentatChunks(from: content)
             
-            print("HALDEBUG-IMPORT: Processed \(url.lastPathComponent): \(content.count) chars, \(chunks.count) chunks")
+            print("HALDEBUG-IMPORT: Processed \(url.lastPathComponent): \(content.count) chars, \(chunks.count) chunks, \(documentEntities.count) entities")
             
             return ProcessedDocument(
                 url: url,
                 filename: url.lastPathComponent,
                 content: content,
                 chunks: chunks,
+                entities: documentEntities,
                 fileExtension: fileExtension
             )
             
@@ -3318,7 +4017,7 @@ class DocumentImportManager: ObservableObject {
         }
     }
     
-    // Content Extraction
+    // Content Extraction (unchanged from previous implementation)
     private func extractContent(from url: URL, fileExtension: String) throws -> String {
         print("HALDEBUG-IMPORT: Extracting content from \(url.lastPathComponent) (.\(fileExtension))")
         
@@ -3384,7 +4083,7 @@ class DocumentImportManager: ObservableObject {
         return result
     }
     
-    // Proven Chunking Strategy (400 chars, 50 overlap)
+    // Proven Chunking Strategy (400 chars, 50 overlap) - unchanged
     private func createMentatChunks(from content: String, targetSize: Int = 400, overlap: Int = 50) -> [String] {
         let cleanedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
         
@@ -3435,21 +4134,13 @@ class DocumentImportManager: ObservableObject {
             chunks.append(currentChunk.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         
-        print("HALDEBUG-IMPORT: Created \(chunks.count) chunks using strategy")
+        print("HALDEBUG-IMPORT: Created \(chunks.count) chunks using MENTAT strategy")
         return chunks
     }
     
-    // COMMENTED OUT: Entity Extraction
-    // Reason: Simplified embedding system doesn't use entity enhancement
-    /*
-    private func extractEntities(from text: String) -> [NamedEntity] {
-        return memoryStore.extractEntities(from: text)
-    }
-    */
-    
-    // LLM Document Summarization
+    // ENHANCED: LLM Document Summarization with entity context
     private func generateDocumentSummary(_ document: ProcessedDocument) async -> String? {
-        print("HALDEBUG-IMPORT: Generating LLM summary for: \(document.filename)")
+        print("HALDEBUG-IMPORT: Generating LLM summary for: \(document.filename) with \(document.entities.count) entities")
         
         // Check if Apple Intelligence is available
         guard #available(macOS 26.0, iOS 26.0, *) else {
@@ -3463,8 +4154,32 @@ class DocumentImportManager: ObservableObject {
         
         do {
             let contentPreview = String(document.content.prefix(500))
+            
+            // ENHANCED: Include entity context in summary generation
+            var entityContext = ""
+            if !document.entities.isEmpty {
+                let personEntities = document.entities.filter { $0.type == .person }.map { $0.text }
+                let placeEntities = document.entities.filter { $0.type == .place }.map { $0.text }
+                let orgEntities = document.entities.filter { $0.type == .organization }.map { $0.text }
+                
+                var entityParts: [String] = []
+                if !personEntities.isEmpty {
+                    entityParts.append("people: \(personEntities.joined(separator: ", "))")
+                }
+                if !placeEntities.isEmpty {
+                    entityParts.append("places: \(placeEntities.joined(separator: ", "))")
+                }
+                if !orgEntities.isEmpty {
+                    entityParts.append("organizations: \(orgEntities.joined(separator: ", "))")
+                }
+                
+                if !entityParts.isEmpty {
+                    entityContext = " Key entities mentioned include \(entityParts.joined(separator: "; "))."
+                }
+            }
+            
             let prompt = """
-            Summarize this document in one clear, descriptive sentence (filename: \(document.filename)):
+            Summarize this document in one clear, descriptive sentence (filename: \(document.filename)):\(entityContext)
             
             \(contentPreview)
             """
@@ -3473,7 +4188,7 @@ class DocumentImportManager: ObservableObject {
             let result = try await session.respond(to: Prompt(prompt))
             
             let summary = result.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            print("HALDEBUG-IMPORT: Generated summary: \(summary)")
+            print("HALDEBUG-IMPORT: Generated entity-enhanced summary: \(summary)")
             return summary
             
         } catch {
@@ -3482,70 +4197,90 @@ class DocumentImportManager: ObservableObject {
         }
     }
     
-    // Unified Memory Storage using simplified embeddings (SIMPLIFIED - no entities)
-    private func storeDocumentsInMemory(_ documents: [ProcessedDocument]) async {
-        print("HALDEBUG-IMPORT: Storing \(documents.count) documents in unified memory")
+    // ENHANCED: Store documents in unified memory with entity keywords
+    private func storeDocumentsInMemoryWithEntities(_ documents: [ProcessedDocument]) async {
+        print("HALDEBUG-IMPORT: Storing \(documents.count) documents in unified memory with entity extraction")
         
         for document in documents {
             // Store source information
             let sourceId = UUID().uuidString
             let timestamp = Date()
             
-            // Store each chunk as unified content using simplified embedding system (no entities)
+            print("HALDEBUG-IMPORT: Processing document \(document.filename) with \(document.entities.count) entities")
+            
+            // ENHANCED: Store each chunk with its specific entity keywords
             for (index, chunk) in document.chunks.enumerated() {
-                let contentId = memoryStore.storeUnifiedContent(
+                // Extract entities specific to this chunk
+                let chunkEntities = memoryStore.extractNamedEntities(from: chunk)
+                
+                // Combine document-level entities with chunk-specific entities for comprehensive coverage
+                let allRelevantEntities = (document.entities + chunkEntities)
+                let uniqueEntities = Array(Set(allRelevantEntities)) // Remove duplicates
+                
+                // Create lowercase entity keywords string for search
+                let entityKeywords = uniqueEntities.map { $0.text.lowercased() }.joined(separator: " ")
+                
+                print("HALDEBUG-IMPORT: Chunk \(index + 1) has \(chunkEntities.count) specific + \(document.entities.count) document entities = \(uniqueEntities.count) total unique")
+                
+                let contentId = memoryStore.storeUnifiedContentWithEntities(
                     content: chunk,
                     sourceType: .document,
                     sourceId: sourceId,
                     position: index,
-                    timestamp: timestamp
+                    timestamp: timestamp,
+                    entityKeywords: entityKeywords
                 )
                 
                 if !contentId.isEmpty {
-                    print("HALDEBUG-IMPORT: Stored chunk \(index + 1)/\(document.chunks.count) for \(document.filename)")
+                    print("HALDEBUG-IMPORT: Stored chunk \(index + 1)/\(document.chunks.count) for \(document.filename) with \(uniqueEntities.count) entities")
                 }
             }
         }
         
-        print("HALDEBUG-IMPORT: Document storage completed")
+        print("HALDEBUG-IMPORT: Enhanced document storage with entities completed")
     }
     
-    // Conversation Message Generation
+    // ENHANCED: Generate import messages with entity context
     private func generateImportMessages(documentSummaries: [String],
                                       totalProcessed: Int,
+                                      totalEntities: Int,
                                       chatViewModel: ChatViewModel) async {
-        print("HALDEBUG-IMPORT: Generating import conversation messages")
+        print("HALDEBUG-IMPORT: Generating import conversation messages with entity context")
         
-        // Create user auto-message
+        // ENHANCED: Create user auto-message with entity context
         let userMessage: String
         if documentSummaries.count == 1 {
-            userMessage = "Hal, here's a document for you: \(documentSummaries[0])"
+            let entityText = totalEntities > 0 ? " containing \(totalEntities) named entities" : ""
+            userMessage = "Hal, here's a document for you\(entityText): \(documentSummaries[0])"
         } else {
             let numberedList = documentSummaries.enumerated().map { (index, summary) in
                 "\(index + 1)) \(summary)"
             }.joined(separator: ", ")
-            userMessage = "Hal, here are \(documentSummaries.count) documents for you: \(numberedList)"
+            let entityText = totalEntities > 0 ? " with \(totalEntities) named entities extracted" : ""
+            userMessage = "Hal, here are \(documentSummaries.count) documents for you\(entityText): \(numberedList)"
         }
         
         // Add user message to conversation
         let userChatMessage = ChatMessage(content: userMessage, isFromUser: true)
         chatViewModel.messages.append(userChatMessage)
         
-        // Generate HAL's response
+        // ENHANCED: Generate HAL's response with entity awareness
         let halResponse: String
         if documentSummaries.count == 1 {
-            halResponse = "Thanks for sharing that document! I've read through it and I'm ready to discuss any questions you have about the content."
+            let entityResponse = totalEntities > 0 ? " I've identified \(totalEntities) named entities within the content, which will help me answer specific questions about people, places, and organizations mentioned." : ""
+            halResponse = "Thanks for sharing that document! I've read through it and processed all the content.\(entityResponse) I'm ready to discuss any questions you have about the material."
         } else {
-            halResponse = "Thanks for those \(documentSummaries.count) documents! I've read through all of them and I'm ready to discuss any aspect of the material you'd like to explore."
+            let entityResponse = totalEntities > 0 ? " I've extracted \(totalEntities) named entities across all documents, giving me detailed knowledge about the people, places, and organizations mentioned." : ""
+            halResponse = "Thanks for those \(documentSummaries.count) documents! I've read through all of them and processed the content.\(entityResponse) I'm ready to discuss any aspect of the material you'd like to explore."
         }
         
         // Add HAL's response
         let halChatMessage = ChatMessage(content: halResponse, isFromUser: false)
         chatViewModel.messages.append(halChatMessage)
         
-        // Store the conversation turn in memory
+        // Store the conversation turn in memory with entity extraction
         let currentTurnNumber = chatViewModel.messages.filter { $0.isFromUser }.count
-        memoryStore.storeTurn(
+        chatViewModel.memoryStore.storeTurn(
             conversationId: chatViewModel.conversationId,
             userMessage: userMessage,
             assistantMessage: halResponse,
@@ -3553,17 +4288,17 @@ class DocumentImportManager: ObservableObject {
             turnNumber: currentTurnNumber
         )
         
-        print("HALDEBUG-IMPORT: Generated import conversation messages")
+        print("HALDEBUG-IMPORT: Generated enhanced import conversation messages with entity context")
     }
 }
 
-// MARK: - Supporting Data Models (SIMPLIFIED - no entities)
+// MARK: - Enhanced Supporting Data Models with Entity Support
 struct ProcessedDocument {
     let url: URL
     let filename: String
     let content: String
     let chunks: [String]
-    // let entities: [NamedEntity] // COMMENTED OUT - no entity extraction
+    let entities: [NamedEntity]  // ENHANCED: Named entities found in document
     let fileExtension: String
 }
 
@@ -3572,6 +4307,7 @@ struct DocumentImportSummary {
     let processedFiles: Int
     let skippedFiles: Int
     let documentSummaries: [String]
+    let totalEntitiesFound: Int  // ENHANCED: Total entities extracted across all documents
     let processingTime: TimeInterval
 }
 
